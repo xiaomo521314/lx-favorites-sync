@@ -509,6 +509,16 @@ const syncModeLabel = (mode) => normalizeSyncMode(mode) === SYNC_MODE_MERGE
   ? '只增加'
   : '完全同步';
 
+// 容器挂在 open ShadowRoot 里：document 级监听器收到的 event.target 会被重定向到宿主节点，
+// 判断“点击是否落在我们的控件里”必须通过 composedPath 检查。
+const eventPathIncludes = (event, element) => {
+  if (!element) {
+    return false;
+  }
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+  return path.includes(element) || (event.target instanceof Node && element.contains(event.target));
+};
+
 // 「同步设置」分区的自绘面板：宿主的 select 会弹出 Windows 系统配色的选项列表，
 // 这里改用自己的下拉控件（颜色跟随主题），并顺带显示上次同步结果。
 const mountSyncSettingsPanel = (folium, container, ctx) => {
@@ -581,8 +591,8 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
       item.addEventListener('click', () => {
         try {
           ctx.params.set({ mode: option.value });
-        } catch {
-          // 导出窗口里是只读值
+        } catch (error) {
+          folium.log.warn('切换同步模式失败', error);
         }
         closeMenu();
       });
@@ -632,7 +642,7 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
   refreshStatus();
 
   const onDocumentPointerDown = (event) => {
-    if (menuOpen && !picker.contains(event.target)) {
+    if (menuOpen && !eventPathIncludes(event, picker)) {
       closeMenu();
     }
   };
@@ -1038,7 +1048,7 @@ const mountMissingPanel = (container, ctx) => {
   window.addEventListener('lx-favorites-sync-updated', onUpdated);
   window.addEventListener('lx-favorites-sync-finished', onFinished);
   const onDocumentPointerDown = (event) => {
-    if (sortMenuOpen && !(sortPickerElement && sortPickerElement.contains(event.target))) {
+    if (sortMenuOpen && !eventPathIncludes(event, sortPickerElement)) {
       closeSortMenu();
     }
   };
