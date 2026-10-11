@@ -8,7 +8,6 @@ const MISSING_SNAPSHOT_KEY = 'lx-favorites-sync-missing';
 const FAVORITE_NAME = 'Liked Songs';
 const SYNC_COMMAND_ID = 'sync-lx-favorites';
 const CHOOSE_COMMAND_ID = 'choose-lx-download-folder';
-const STATUS_COMMAND_ID = 'show-sync-status';
 const RESTORE_COMMAND_ID = 'restore-last-sync';
 const OPEN_MISSING_COMMAND_ID = 'open-missing-songs';
 const MISSING_PANEL_TAB_ID = 'local-missing';
@@ -510,6 +509,157 @@ const syncModeLabel = (mode) => normalizeSyncMode(mode) === SYNC_MODE_MERGE
   ? '只增加'
   : '完全同步';
 
+// 「同步设置」分区的自绘面板：宿主的 select 会弹出 Windows 系统配色的选项列表，
+// 这里改用自己的下拉控件（颜色跟随主题），并顺带显示上次同步结果。
+const mountSyncSettingsPanel = (folium, container, ctx) => {
+  const isChinese = String(ctx?.locale || '').toLowerCase().startsWith('zh');
+  const text = (zh, en) => isChinese ? zh : en;
+  const theme = ctx?.getTheme?.() || {};
+  const lightTheme = isLightColor(theme.backgroundColor);
+  const hoverAlpha = lightTheme ? 10 : 20;
+  const activeAlpha = lightTheme ? 8 : 12;
+
+  const root = document.createElement('div');
+  root.style.cssText = 'display:flex;flex-direction:column;gap:10px;color:var(--folium-primary,inherit);font-family:var(--folium-font,inherit);';
+  container.replaceChildren(root);
+
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:10px;font-size:13px;';
+  const label = document.createElement('span');
+  label.textContent = text('同步模式', 'Sync mode');
+  label.style.cssText = 'min-width:64px;opacity:.85;';
+
+  const options = [
+    { value: SYNC_MODE_MERGE, label: text('只增加（推荐）', 'Add only (recommended)') },
+    { value: SYNC_MODE_MIRROR, label: text('完全同步', 'Full mirror') }
+  ];
+  const findOption = (value) => (
+    options.find((option) => option.value === normalizeSyncMode(value)) || options[0]
+  );
+
+  const picker = document.createElement('div');
+  picker.style.cssText = 'position:relative;display:inline-flex;';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.setAttribute('aria-haspopup', 'listbox');
+  button.style.cssText = 'display:inline-flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb, currentColor 40%, transparent);border-radius:8px;padding:4px 10px;background:color-mix(in srgb, currentColor 5%, transparent);color:inherit;font:inherit;font-size:13px;line-height:1.4;cursor:pointer;';
+
+  let menuOpen = false;
+  let menuElement = null;
+  const paintButton = () => {
+    button.textContent = `${findOption(ctx.params.get().mode).label} ▾`;
+    button.setAttribute('aria-expanded', menuOpen ? 'true' : 'false');
+  };
+  const closeMenu = () => {
+    menuOpen = false;
+    if (menuElement && menuElement.isConnected) {
+      menuElement.remove();
+    }
+    menuElement = null;
+    paintButton();
+  };
+  const openMenu = () => {
+    menuOpen = true;
+    const menu = document.createElement('div');
+    menu.setAttribute('role', 'listbox');
+    menu.style.cssText = 'position:absolute;top:calc(100% + 5px);left:0;min-width:100%;z-index:1000;display:flex;flex-direction:column;gap:2px;padding:4px;border-radius:9px;box-sizing:border-box;white-space:nowrap;background:var(--folium-bg,#1b1b1f);border:1px solid color-mix(in srgb, currentColor 28%, transparent);box-shadow:0 8px 22px rgba(0,0,0,0.3);';
+    options.forEach((option) => {
+      const isActive = option.value === normalizeSyncMode(ctx.params.get().mode);
+      const item = document.createElement('div');
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      item.textContent = option.label;
+      const baseBackground = isActive ? `color-mix(in srgb, currentColor ${activeAlpha}%, transparent)` : 'transparent';
+      item.style.cssText = `padding:5px 10px;border-radius:6px;font-size:13px;line-height:1.5;cursor:pointer;user-select:none;${isActive ? 'font-weight:600;' : ''}`;
+      item.style.backgroundColor = baseBackground;
+      item.addEventListener('mouseenter', () => {
+        item.style.backgroundColor = `color-mix(in srgb, currentColor ${hoverAlpha}%, transparent)`;
+      });
+      item.addEventListener('mouseleave', () => {
+        item.style.backgroundColor = baseBackground;
+      });
+      item.addEventListener('click', () => {
+        try {
+          ctx.params.set({ mode: option.value });
+        } catch {
+          // 导出窗口里是只读值
+        }
+        closeMenu();
+      });
+      menu.append(item);
+    });
+    picker.append(menu);
+    menuElement = menu;
+    paintButton();
+  };
+  button.addEventListener('click', () => {
+    if (menuOpen) {
+      closeMenu();
+    } else {
+      openMenu();
+    }
+  });
+  picker.append(button);
+  row.append(label, picker);
+
+  const hint = document.createElement('div');
+  hint.textContent = text(
+    '只增加：只追加收藏，从不删除；完全同步：与 LX 保持一致（会移除 LX 里没有的收藏）。更改立即保存，不会自动同步。',
+    'Add only: append, never remove. Full mirror: match LX exactly (removes favorites missing from LX). Changes save immediately without syncing.'
+  );
+  hint.style.cssText = 'font-size:12px;line-height:1.55;opacity:.62;';
+
+  const statusLine = document.createElement('div');
+  statusLine.style.cssText = 'font-size:12px;line-height:1.5;opacity:.78;';
+  const refreshStatus = () => {
+    if (folium.env.context !== 'main') {
+      statusLine.remove();
+      return;
+    }
+    folium.rpc.call('lx.read-status').then((status) => {
+      if (!status || status.ok === null || status.ok === undefined) {
+        statusLine.textContent = text('还没有同步记录；点进度条旁的按钮可以立即同步。', 'No sync yet; use the button next to the progress bar.');
+        return;
+      }
+      const at = String(status.at || '');
+      const time = at.includes('T') ? `${at.slice(0, 10)} ${at.slice(11, 16)}` : '';
+      statusLine.textContent = text(
+        `上次同步：${status.ok ? '成功' : '失败'} · 匹配 ${status.matchedCount || 0}/${status.sourceCount || 0} · 缺失 ${status.unmatchedCount || 0}${time ? ` · ${time}` : ''}`,
+        `Last sync: ${status.ok ? 'ok' : 'failed'} · matched ${status.matchedCount || 0}/${status.sourceCount || 0} · missing ${status.unmatchedCount || 0}${time ? ` · ${time}` : ''}`
+      );
+    }).catch(() => undefined);
+  };
+  refreshStatus();
+
+  const onDocumentPointerDown = (event) => {
+    if (menuOpen && !picker.contains(event.target)) {
+      closeMenu();
+    }
+  };
+  const onDocumentKeyDown = (event) => {
+    if (event.key === 'Escape') {
+      closeMenu();
+    }
+  };
+  const onSyncFinished = () => refreshStatus();
+  document.addEventListener('pointerdown', onDocumentPointerDown, true);
+  document.addEventListener('keydown', onDocumentKeyDown);
+  window.addEventListener('lx-favorites-sync-finished', onSyncFinished);
+  const offParams = typeof ctx?.params?.subscribe === 'function'
+    ? ctx.params.subscribe(() => paintButton())
+    : () => undefined;
+  paintButton();
+  root.append(row, hint, statusLine);
+
+  return () => {
+    document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+    document.removeEventListener('keydown', onDocumentKeyDown);
+    window.removeEventListener('lx-favorites-sync-finished', onSyncFinished);
+    offParams();
+    closeMenu();
+  };
+};
+
 const syncOnce = async (folium, reason) => {
   await syncModeReady.catch(() => undefined);
   await waitForDatabase();
@@ -919,7 +1069,6 @@ export default function activate(folium) {
   let command = null;
   let chooseCommand = null;
   let modeSection = null;
-  let statusCommand = null;
   let restoreCommand = null;
   let openMissingCommand = null;
   let controlButton = null;
@@ -1089,7 +1238,8 @@ export default function activate(folium) {
             ],
             defaultValue: SYNC_MODE_MERGE
           }
-        ]
+        ],
+        settingsPanel: (container, panelCtx) => mountSyncSettingsPanel(folium, container, panelCtx)
       });
 
       currentSyncMode = normalizeSyncMode(modeSection.params.get().mode);
@@ -1142,40 +1292,6 @@ export default function activate(folium) {
   } catch (error) {
     folium.log.warn('注册同步设置分区失败', error);
   }
-
-  statusCommand = folium.registries.commands.register({
-    id: STATUS_COMMAND_ID,
-    label: {
-      'zh-CN': '查看 LX 收藏同步状态',
-      en: 'Show LX Favorite Sync Status'
-    },
-    description: {
-      'zh-CN': '查看当前同步模式、上次同步结果、匹配数量和最近一次是否有移除。',
-      en: 'Show the current sync mode, last result, match count, and whether entries were removed.'
-    },
-    run: async () => {
-      try {
-        const status = await folium.rpc.call('lx.read-status');
-        const mode = syncModeLabel(currentSyncMode);
-        if (!status || status.ok === null || status.ok === undefined) {
-          folium.ui.toast(`当前模式：${mode}。还没有同步记录，请先执行一次同步。`, {
-            type: 'info',
-            durationMs: 9000
-          });
-          return;
-        }
-        const result = status.ok ? '成功' : '失败';
-        const text = `模式：${mode}；上次同步：${result}；匹配 ${status.matchedCount || 0}/${status.sourceCount || 0}；新增 ${status.addedCount || 0}；移除 ${status.removedCount || 0}`;
-        folium.ui.toast(text, {
-          type: status.ok ? 'info' : 'error',
-          durationMs: 12000
-        });
-      } catch (error) {
-        folium.log.error('读取 LX 收藏同步状态失败', error);
-        folium.ui.toast(`读取同步状态失败：${error.message}`, { type: 'error', durationMs: 9000 });
-      }
-    }
-  });
 
   restoreCommand = folium.registries.commands.register({
     id: RESTORE_COMMAND_ID,
@@ -1371,7 +1487,6 @@ export default function activate(folium) {
       command?.unregister();
       chooseCommand?.unregister();
       modeSection?.unregister();
-      statusCommand?.unregister();
       restoreCommand?.unregister();
       openMissingCommand?.unregister();
       controlButton?.unregister();
