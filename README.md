@@ -85,7 +85,7 @@ lx-favorites-sync/       # 模组本体（投稿时指向这个目录）
 
 - 本模组是个人项目，非 Folia、LX Music 官方项目，与二者无隶属关系。
 - [LX Music](https://github.com/lyswhut/lx-music-desktop) 是开源项目（Apache-2.0）；本模组不包含、不分发其任何代码，只以只读方式访问其本地数据库文件。
-- 本项目由 AI 编程助手（DeepSeek V4 Flash，昵称「吃白饭的蓝色大肥鱼」）与 xiaomo521314 协作开发，代码经作者测试后发布。
+- 本项目由 AI （DeepSeek V4 Flash，昵称「吃白饭的蓝色大肥鱼」）与 xiaomo521314 协作开发，代码经作者测试后发布。
 
 ## 许可证
 
