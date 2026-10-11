@@ -1,0 +1,10 @@
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与签名（签名由模组市场 CI 生成，不要进仓库）
+*.log
+folium.sig.json
+
+node_modules/
