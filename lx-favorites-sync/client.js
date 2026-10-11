@@ -8,7 +8,6 @@ const MISSING_SNAPSHOT_KEY = 'lx-favorites-sync-missing';
 const FAVORITE_NAME = 'Liked Songs';
 const SYNC_COMMAND_ID = 'sync-lx-favorites';
 const CHOOSE_COMMAND_ID = 'choose-lx-download-folder';
-const TOGGLE_MODE_COMMAND_ID = 'toggle-sync-mode';
 const STATUS_COMMAND_ID = 'show-sync-status';
 const RESTORE_COMMAND_ID = 'restore-last-sync';
 const OPEN_MISSING_COMMAND_ID = 'open-missing-songs';
@@ -17,6 +16,11 @@ const SYNC_MODE_MIRROR = 'mirror';
 const SYNC_MODE_MERGE = 'merge';
 const STARTUP_DELAY_MS = 4500;
 const DB_WAIT_TIMEOUT_MS = 20000;
+
+// 同步模式（完全同步 / 只增加）现在由模组面板的「同步设置」分区维护；
+// 用模块级变量保存，供模块级的 syncOnce 跨 activate 边界读取。
+let currentSyncMode = SYNC_MODE_MERGE;
+let syncModeReady = Promise.resolve();
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -507,6 +511,7 @@ const syncModeLabel = (mode) => normalizeSyncMode(mode) === SYNC_MODE_MERGE
   : '完全同步';
 
 const syncOnce = async (folium, reason) => {
+  await syncModeReady.catch(() => undefined);
   await waitForDatabase();
   const database = await openDatabase();
   try {
@@ -544,8 +549,7 @@ const syncOnce = async (folium, reason) => {
       throw new Error('LX 收藏没有匹配到 Folia 本地曲库，已停止同步');
     }
 
-    const settings = await folium.rpc.call('lx.read-settings').catch(() => ({ mode: SYNC_MODE_MIRROR }));
-    const syncMode = normalizeSyncMode(settings?.mode);
+    const syncMode = normalizeSyncMode(currentSyncMode);
     const previousState = await readCachedData(database, SYNC_STATE_KEY);
     const lastMatchedCount = Number(previousState?.lastMatchedCount) || 0;
     if (
@@ -914,7 +918,7 @@ export default function activate(folium) {
   let startupTimer = null;
   let command = null;
   let chooseCommand = null;
-  let toggleCommand = null;
+  let modeSection = null;
   let statusCommand = null;
   let restoreCommand = null;
   let openMissingCommand = null;
@@ -977,12 +981,11 @@ export default function activate(folium) {
       } catch (error) {
         folium.log.error('LX 收藏同步失败', error);
         folium.ui.toast(`LX 收藏同步失败：${error.message}`, { type: 'error', durationMs: 9000 });
-        const settings = await folium.rpc.call('lx.read-settings').catch(() => ({ mode: SYNC_MODE_MIRROR }));
         await folium.rpc.call('lx.write-status', {
           ok: false,
           at: new Date().toISOString(),
           reason,
-          mode: settings?.mode,
+          mode: currentSyncMode,
           error: error.message
         }).catch(() => undefined);
         window.dispatchEvent(new CustomEvent('lx-favorites-sync-finished', {
@@ -1053,36 +1056,92 @@ export default function activate(folium) {
     }
   });
 
-  toggleCommand = folium.registries.commands.register({
-    id: TOGGLE_MODE_COMMAND_ID,
-    label: {
-      'zh-CN': '切换 LX 收藏同步模式',
-      en: 'Toggle LX Favorite Sync Mode'
-    },
-    description: {
-      'zh-CN': '在“完全同步”和“只增加”之间切换；切换后会立即同步一次。',
-      en: 'Toggle between full mirror sync and add-only sync, then synchronize once.'
-    },
-    run: async () => {
-      try {
-        const settings = await folium.rpc.call('lx.read-settings');
-        const nextMode = normalizeSyncMode(settings?.mode) === SYNC_MODE_MIRROR
-          ? SYNC_MODE_MERGE
-          : SYNC_MODE_MIRROR;
-        await folium.rpc.call('lx.write-settings', { mode: nextMode });
-        const warning = nextMode === SYNC_MODE_MIRROR
-          ? '下次同步会移除 Folia 中 LX 没有的收藏'
-          : '下次同步只会增加，不会删除已有收藏';
-        folium.ui.toast(`同步模式已切换为：${syncModeLabel(nextMode)}。${warning}`, {
-          type: nextMode === SYNC_MODE_MIRROR ? 'info' : 'success',
-          durationMs: 9000
-        });
-      } catch (error) {
-        folium.log.error('切换 LX 收藏同步模式失败', error);
-        folium.ui.toast(`切换同步模式失败：${error.message}`, { type: 'error', durationMs: 9000 });
-      }
+  // 同步模式选择器：显示在模组面板的「同步设置」分区（命令卡片上方），
+  // 直接展示当前模式并可直接点选切换；更改只保存、不自动同步——避免切到
+  // 「完全同步」时立刻删除收藏。
+  try {
+    if (folium.registries.settingsSections && typeof folium.registries.settingsSections.register === 'function') {
+      modeSection = folium.registries.settingsSections.register({
+        id: 'sync-settings',
+        label: {
+          'zh-CN': '同步设置',
+          en: 'Sync settings'
+        },
+        description: {
+          'zh-CN': '选择「我喜欢」同步到 Folia 收藏的方式；更改会立即保存，不会自动同步。',
+          en: 'How LX favorites sync into Folia. Changes save immediately without syncing.'
+        },
+        settings: [
+          {
+            key: 'mode',
+            type: 'select',
+            label: {
+              'zh-CN': '同步模式',
+              en: 'Sync mode'
+            },
+            description: {
+              'zh-CN': '只增加：只追加收藏，从不删除；完全同步：Folia 收藏与 LX 保持一致（会移除 LX 里没有的收藏，谨慎选择）。',
+              en: 'Add only: append favorites, never remove. Full mirror: Folia favorites match LX (removes ones missing from LX; use with care).'
+            },
+            options: [
+              { value: SYNC_MODE_MERGE, label: { 'zh-CN': '只增加（推荐）', en: 'Add only (recommended)' } },
+              { value: SYNC_MODE_MIRROR, label: { 'zh-CN': '完全同步', en: 'Full mirror' } }
+            ],
+            defaultValue: SYNC_MODE_MERGE
+          }
+        ]
+      });
+
+      currentSyncMode = normalizeSyncMode(modeSection.params.get().mode);
+      modeSection.params.subscribe(() => {
+        const nextMode = normalizeSyncMode(modeSection.params.get().mode);
+        if (nextMode === currentSyncMode) {
+          return;
+        }
+        currentSyncMode = nextMode;
+        if (folium.env.context === 'main') {
+          void folium.rpc.call('lx.write-settings', { mode: nextMode }).catch(() => undefined);
+        }
+        folium.ui.toast(
+          nextMode === SYNC_MODE_MIRROR
+            ? '同步模式已设为：完全同步（下次同步会移除 LX 里没有的收藏）'
+            : '同步模式已设为：只增加',
+          { type: nextMode === SYNC_MODE_MIRROR ? 'info' : 'success', durationMs: 7000 }
+        );
+      });
+
+      // 旧版本把模式存在 lx-favorites-sync-settings.json 里；首次升级时以文件为准迁移一次。
+      syncModeReady = (async () => {
+        if (folium.env.context !== 'main') {
+          return;
+        }
+        try {
+          const fileSettings = await folium.rpc.call('lx.read-settings');
+          if (fileSettings && fileSettings.mode) {
+            const fileMode = normalizeSyncMode(fileSettings.mode);
+            if (fileMode !== currentSyncMode) {
+              currentSyncMode = fileMode;
+              modeSection.params.set({ mode: fileMode });
+            }
+          }
+        } catch {
+          // 读不到旧设置文件时保持界面上的值
+        }
+      })();
+    } else {
+      // 老宿主没有设置分区：仍然从旧设置文件恢复模式
+      syncModeReady = (async () => {
+        try {
+          const fileSettings = await folium.rpc.call('lx.read-settings');
+          currentSyncMode = normalizeSyncMode(fileSettings?.mode);
+        } catch {
+          // 保持默认的“只增加”
+        }
+      })();
     }
-  });
+  } catch (error) {
+    folium.log.warn('注册同步设置分区失败', error);
+  }
 
   statusCommand = folium.registries.commands.register({
     id: STATUS_COMMAND_ID,
@@ -1096,11 +1155,8 @@ export default function activate(folium) {
     },
     run: async () => {
       try {
-        const [settings, status] = await Promise.all([
-          folium.rpc.call('lx.read-settings'),
-          folium.rpc.call('lx.read-status')
-        ]);
-        const mode = syncModeLabel(settings?.mode);
+        const status = await folium.rpc.call('lx.read-status');
+        const mode = syncModeLabel(currentSyncMode);
         if (!status || status.ok === null || status.ok === undefined) {
           folium.ui.toast(`当前模式：${mode}。还没有同步记录，请先执行一次同步。`, {
             type: 'info',
@@ -1314,7 +1370,7 @@ export default function activate(folium) {
     try {
       command?.unregister();
       chooseCommand?.unregister();
-      toggleCommand?.unregister();
+      modeSection?.unregister();
       statusCommand?.unregister();
       restoreCommand?.unregister();
       openMissingCommand?.unregister();
