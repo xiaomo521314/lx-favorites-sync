@@ -918,6 +918,7 @@ export default function activate(folium) {
   let statusCommand = null;
   let restoreCommand = null;
   let openMissingCommand = null;
+  let controlButton = null;
   let panelTab = null;
   let missingRequestHandler = null;
 
@@ -1227,6 +1228,73 @@ export default function activate(folium) {
     }
   });
 
+  // 播放器进度条旁的「一键同步」按钮（参照 lyrics-list 的 controlButtons 用法）。
+  // 单击立即同步；悬停提示里附带上次同步结果。老版本 Folium 没有这个注册表时自动跳过。
+  if (folium.registries.controlButtons && typeof folium.registries.controlButtons.register === 'function') {
+    try {
+      controlButton = folium.registries.controlButtons.register({
+        id: 'sync-now',
+        slot: 'progress.trailing',
+        order: 540,
+        mount(container, ctx) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.title = '同步 LX Music 收藏';
+          button.setAttribute('aria-label', '同步 LX Music 收藏');
+          button.style.cssText = 'display:grid;place-items:center;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:none;cursor:pointer;';
+          button.textContent = '↻';
+
+          const iconCandidates = ['refresh-cw', 'rotate-cw', 'refresh', 'repeat'];
+          const loadIcon = (index) => {
+            if (index >= iconCandidates.length) {
+              return Promise.resolve(null);
+            }
+            return Promise.resolve(folium.ui.icon(iconCandidates[index], { size: 16 }))
+              .then((icon) => icon || loadIcon(index + 1))
+              .catch(() => loadIcon(index + 1));
+          };
+          loadIcon(0).then((icon) => {
+            if (icon && button.isConnected) {
+              button.replaceChildren(icon);
+            }
+          }).catch(() => undefined);
+
+          const refreshTitle = () => {
+            folium.rpc.call('lx.read-status').then((status) => {
+              if (status && typeof status.matchedCount === 'number') {
+                const suffix = status.unmatchedCount > 0 ? `，缺失 ${status.unmatchedCount}` : '';
+                button.title = `上次同步：匹配 ${status.matchedCount}/${status.sourceCount}${suffix} · 点击立即同步`;
+              }
+            }).catch(() => undefined);
+          };
+          refreshTitle();
+
+          const paint = () => {
+            const colors = ctx.getColors() || {};
+            button.style.color = colors.text || 'inherit';
+          };
+          const onClick = () => {
+            void run('manual');
+          };
+          button.addEventListener('click', onClick);
+          container.appendChild(button);
+          paint();
+          const offColors = typeof ctx.subscribe === 'function' ? ctx.subscribe(paint) : () => undefined;
+          const onSyncFinished = () => refreshTitle();
+          window.addEventListener('lx-favorites-sync-finished', onSyncFinished);
+          return () => {
+            offColors();
+            window.removeEventListener('lx-favorites-sync-finished', onSyncFinished);
+            button.removeEventListener('click', onClick);
+            button.remove();
+          };
+        }
+      });
+    } catch (error) {
+      folium.log.warn('注册播放器一键同步按钮失败', error);
+    }
+  }
+
   startupTimer = window.setTimeout(() => {
     void run('startup');
   }, STARTUP_DELAY_MS);
@@ -1250,6 +1318,7 @@ export default function activate(folium) {
       statusCommand?.unregister();
       restoreCommand?.unregister();
       openMissingCommand?.unregister();
+      controlButton?.unregister();
       panelTab?.unregister();
     } catch {
       // The host may already have removed the command.
