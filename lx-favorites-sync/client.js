@@ -519,6 +519,16 @@ const eventPathIncludes = (event, element) => {
   return path.includes(element) || (event.target instanceof Node && element.contains(event.target));
 };
 
+// 状态文件写的是 UTC ISO 时间；界面里统一换算成本地时间显示。
+const formatLocalTimestamp = (value) => {
+  const date = new Date(String(value || ''));
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+
 // 「同步设置」分区的自绘面板：宿主的 select 会弹出 Windows 系统配色的选项列表，
 // 这里改用自己的下拉控件（颜色跟随主题），并顺带显示上次同步结果。
 const mountSyncSettingsPanel = (folium, container, ctx) => {
@@ -631,8 +641,7 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
         statusLine.textContent = text('还没有同步记录；点进度条旁的按钮可以立即同步。', 'No sync yet; use the button next to the progress bar.');
         return;
       }
-      const at = String(status.at || '');
-      const time = at.includes('T') ? `${at.slice(0, 10)} ${at.slice(11, 16)}` : '';
+      const time = formatLocalTimestamp(status.at);
       statusLine.textContent = text(
         `上次同步：${status.ok ? '成功' : '失败'} · 匹配 ${status.matchedCount || 0}/${status.sourceCount || 0} · 缺失 ${status.unmatchedCount || 0}${time ? ` · ${time}` : ''}`,
         `Last sync: ${status.ok ? 'ok' : 'failed'} · matched ${status.matchedCount || 0}/${status.sourceCount || 0} · missing ${status.unmatchedCount || 0}${time ? ` · ${time}` : ''}`
