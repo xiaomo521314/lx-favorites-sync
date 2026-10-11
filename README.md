@@ -2,7 +2,7 @@
 
 一个 Folia 模组：把 **LX Music 的「我喜欢」** 自动同步到 **Folia 的本地收藏（Liked Songs）**。
 
-> 作者：xiaomo521314 × Codex ｜ 许可证：MIT
+> 作者：xiaomo521314 × 吃白饭的蓝色大肥鱼 ｜ 许可证：MIT
 
 ## 特性
 
@@ -21,9 +21,9 @@
 
 ### 手动安装
 
-1. 完全退出 Folia。
-2. 双击 `安装到Folia.cmd`（会自动开启 Folia 的实验性模组系统）。
-3. 启动 Folia → 设置里的「模组」（或命令面板的「模组管理」）→ 启用「LX Music 收藏同步」，并在确认弹窗中确认一次。
+1. 打开 Folia →「设置 → 实验室」，开启模组系统。
+2. 把 `lx-favorites-sync` 文件夹压缩成 zip（zip 顶层就是这个文件夹），拖进 Folia 的「模组管理」面板；也可以直接把该文件夹复制进 `%APPDATA%\Folia\mods\`。
+3. 启用「LX Music 收藏同步」，并在确认弹窗中确认一次。
 
 首次使用在 Folia 命令面板执行一次 `选择 LX 下载目录`，选中 LX Music 的下载根目录（例如 `E:\你的歌品`）。
 以后每次启动 Folia 都会自动重扫该目录并同步。Windows 不允许程序绕过用户授权读取任意目录，这一次授权是必要的，句柄会保存在 Folia 本地数据库中。
@@ -66,22 +66,17 @@ Folia 命令面板（`Ctrl+K`）中的命令：
 ## 兼容性
 
 - Folia：`>=0.7.17 <0.8.0`（需要开启实验性模组系统）。
-- 平台：面向 Windows 版 Folia；自动化脚本为 `.cmd`。
+- 平台：面向 Windows 版 Folia。
 - LX Music 数据目录非默认位置时，可设置环境变量 `LX_MUSIC_DATA_DIR` 指向包含 `lx.data.db` 的目录。
 
 ## 目录结构
 
 ```
-LX-Folia同步器/
-├─ Folia-Mod/            # 模组本体（投稿时指向这个目录）
-│  ├─ mod.json
-│  ├─ main.cjs           # Node 端：读取 LX 数据库、写日志/状态/备份
-│  ├─ client.js          # 渲染端：匹配、写入 Folia 收藏、命令与面板
-│  └─ preview.jpg        # 模组市场介绍图
-├─ 安装到Folia.cmd
-├─ 卸载从Folia.cmd
-├─ 打开日志.cmd
-└─ 打开同步状态.cmd
+lx-favorites-sync/       # 模组本体（投稿时指向这个目录）
+├─ mod.json
+├─ main.cjs              # Node 端：读取 LX 数据库、写日志/状态/备份
+├─ client.js             # 渲染端：匹配、写入 Folia 收藏、命令与面板
+└─ preview.jpg           # 模组市场介绍图
 ```
 
 ## 许可证
