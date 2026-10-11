@@ -2,12 +2,10 @@ const DB_NAME = 'KineticPlayerDB';
 const LOCAL_MUSIC_STORE = 'local_music';
 const CACHE_STORE = 'api_cache';
 const LOCAL_PLAYLISTS_KEY = 'local_playlists';
-const LOCAL_DIR_HANDLES_KEY = 'local_dir_handles';
 const SYNC_STATE_KEY = 'lx-favorites-sync-state';
 const MISSING_SNAPSHOT_KEY = 'lx-favorites-sync-missing';
 const FAVORITE_NAME = 'Liked Songs';
 const SYNC_COMMAND_ID = 'sync-lx-favorites';
-const CHOOSE_COMMAND_ID = 'choose-lx-download-folder';
 const RESTORE_COMMAND_ID = 'restore-last-sync';
 const OPEN_MISSING_COMMAND_ID = 'open-missing-songs';
 const MISSING_PANEL_TAB_ID = 'local-missing';
@@ -15,11 +13,15 @@ const SYNC_MODE_MIRROR = 'mirror';
 const SYNC_MODE_MERGE = 'merge';
 const STARTUP_DELAY_MS = 4500;
 const DB_WAIT_TIMEOUT_MS = 20000;
+const MAX_CHANGE_DETAILS = 300;
 
 // 同步模式（完全同步 / 只增加）现在由模组面板的「同步设置」分区维护；
 // 用模块级变量保存，供模块级的 syncOnce 跨 activate 边界读取。
 let currentSyncMode = SYNC_MODE_MERGE;
 let syncModeReady = Promise.resolve();
+
+// Folia 在 activate 时注入；供跨作用域的 storage 读写小工具使用。
+let foliumRef = null;
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -219,6 +221,57 @@ const durationMatches = (song, lxItem) => {
     || song.durationSecRounded === lxItem.durationSec;
 };
 
+// 文件名提示用的宽松归一化：只做大小写/标点统一，不去版本后缀、不去 feat.，
+// 目的是判断"磁盘上有这么个文件"，不用于严格匹配。
+const normalizeFileHint = (value) => String(value == null ? '' : value)
+  .normalize('NFKC')
+  .toLowerCase()
+  .replace(/\.(mp3|flac|m4a|wav|ogg|opus|aac|alac|ape|wv|tta|wma|aif|aiff|caf)$/gi, '')
+  .replace(/[\s\-_.·•・:：,，、/\\|&+;；'"“”‘’!！?？()（）[\]]/g, '')
+  .trim();
+
+// 主进程给了两条线索：downloadIndex（LX 下载记录，精确到歌曲 id）和
+// scannedFiles（LX 下载目录里实际存在的音频文件名，宽松探测）。
+const buildMissingHints = (downloadInfo) => ({
+  index: downloadInfo && typeof downloadInfo.downloadIndex === 'object' && !Array.isArray(downloadInfo.downloadIndex)
+    ? downloadInfo.downloadIndex
+    : {},
+  files: Array.isArray(downloadInfo?.scannedFiles)
+    ? downloadInfo.scannedFiles
+      .map((name) => normalizeFileHint(name))
+      .filter((name) => name.length >= 2)
+    : []
+});
+
+// 'downloaded'：LX 有该曲的下载记录且文件还在 → 确定是"已下载但未被 Folia 收录"。
+// 'scan-maybe'：下载目录里存在文件名同时包含歌名与任一歌手的文件 → 疑似。
+const classifyMissing = (lxItem, hints) => {
+  const entry = hints.index[lxItem.id];
+  if (entry && entry.exists === true) {
+    return 'downloaded';
+  }
+  if (hints.files.length === 0) {
+    return '';
+  }
+  const title = normalizeFileHint(lxItem.title);
+  if (!title || title.length < 2) {
+    return '';
+  }
+  const artists = String(lxItem.artist || '')
+    .split(/[,，、/&;；]+/)
+    .map((part) => normalizeFileHint(part))
+    .filter((part) => part.length >= 1);
+  for (const file of hints.files) {
+    if (!file.includes(title)) {
+      continue;
+    }
+    if (artists.length === 0 || artists.some((artist) => file.includes(artist))) {
+      return 'scan-maybe';
+    }
+  }
+  return '';
+};
+
 const chooseCandidate = (lxItem, index) => {
   if (!lxItem.title || !lxItem.artist) {
     return null;
@@ -238,8 +291,9 @@ const chooseCandidate = (lxItem, index) => {
   return best.song;
 };
 
-const matchFavorites = (favorites, songs) => {
+const matchFavorites = (favorites, songs, downloadInfo) => {
   const index = buildSongIndex(songs);
+  const hints = buildMissingHints(downloadInfo);
   const matchedIds = [];
   const unmatched = [];
   const seenIds = new Set();
@@ -248,7 +302,12 @@ const matchFavorites = (favorites, songs) => {
     const lxItem = lxRecord(favorite);
     const song = chooseCandidate(lxItem, index);
     if (!song) {
-      unmatched.push({ id: lxItem.id, name: lxItem.title, singer: lxItem.artist });
+      const item = { id: lxItem.id, name: lxItem.title, singer: lxItem.artist };
+      const hint = classifyMissing(lxItem, hints);
+      if (hint) {
+        item.hint = hint;
+      }
+      unmatched.push(item);
       return;
     }
     if (!seenIds.has(song.id)) {
@@ -309,10 +368,13 @@ const putOne = async (database, storeName, value) => new Promise((resolve, rejec
   transaction.onabort = () => reject(transaction.error || new Error('IndexedDB 写入已取消'));
 });
 
-const readCachedData = async (database, key) => {
-  const record = await readOne(database, CACHE_STORE, key);
-  return record ? record.data : undefined;
-};
+const deleteOne = async (database, storeName, key) => new Promise((resolve, reject) => {
+  const transaction = database.transaction(storeName, 'readwrite');
+  transaction.objectStore(storeName).delete(key);
+  transaction.oncomplete = () => resolve();
+  transaction.onerror = () => reject(transaction.error || new Error('IndexedDB 删除失败'));
+  transaction.onabort = () => reject(transaction.error || new Error('IndexedDB 删除已取消'));
+});
 
 const writeCachedData = async (database, key, data) => {
   await putOne(database, CACHE_STORE, {
@@ -322,74 +384,55 @@ const writeCachedData = async (database, key, data) => {
   });
 };
 
-const loadFoliaBootstrap = (() => {
-  let loadPromise = null;
-  return () => {
-    if (!loadPromise) {
-      loadPromise = (async () => {
-        const mainScript = Array.from(document.querySelectorAll('script[type="module"][src]'))
-          .map((script) => script.src)
-          .find((source) => /\/assets\/main-[^/]+\.js(?:\?|$)/.test(source));
-        const candidates = [];
-        const addCandidate = (url) => {
-          if (url && !candidates.includes(url)) {
-            candidates.push(url);
-          }
-        };
-
-        if (mainScript) {
-          addCandidate(new URL('./bootstrap-KlVCxytD.js', mainScript).href);
-          try {
-            const source = await (await fetch(mainScript)).text();
-            const match = source.match(/["']\.\/(bootstrap-[^"']+\.js)["']/);
-            if (match) {
-              addCandidate(new URL(`./${match[1]}`, mainScript).href);
-            }
-          } catch {
-            // A file URL may be unreadable through fetch in some Electron builds.
-          }
-        }
-        performance.getEntriesByType('resource')
-          .map((entry) => entry.name)
-          .filter((url) => /\/assets\/bootstrap-[^/]+\.js(?:\?|$)/.test(url))
-          .forEach(addCandidate);
-        addCandidate(new URL('./assets/bootstrap-KlVCxytD.js', document.baseURI).href);
-
-        for (const url of candidates) {
-          try {
-            const module = await import(/* @vite-ignore */ url);
-            const importFunction = Object.values(module)
-              .find((value) => typeof value === 'function' && value.name === 'Pk')
-              || module.Xn;
-            if (typeof importFunction === 'function') {
-              return importFunction;
-            }
-          } catch {
-            // Folia updates can change the chunk hash; try the next candidate.
-          }
-        }
-        return null;
-      })();
+// 同步状态/缺失快照这类小数据存进 Folia 官方 storage（与主进程共享同一份
+// mod-data.json）；旧版本存在 IndexedDB 里的键在首次读取时迁移一次。
+const readPersistedState = async (key, database) => {
+  const storage = foliumRef && foliumRef.storage ? foliumRef.storage : null;
+  if (storage) {
+    try {
+      const value = await storage.get(key);
+      if (value !== undefined) {
+        return value;
+      }
+    } catch {
+      // storage 不可用（老宿主/非主窗口）时回落到 IndexedDB。
     }
-    return loadPromise;
-  };
-})();
-
-const toBasename = (value) => String(value || '')
-  .replace(/\\/g, '/')
-  .replace(/\/+$/, '')
-  .split('/')
-  .pop() || '';
-
-const findSavedRootName = (state, handles, lxSavePath) => {
-  if (state?.rootName && handles && handles[state.rootName]) {
-    return state.rootName;
   }
-  const expectedName = toBasename(lxSavePath);
-  if (!expectedName || !handles) {
-    return '';
+  if (!database) {
+    return undefined;
   }
-  return Object.keys(handles).find((name) => name.toLowerCase() === expectedName.toLowerCase()) || '';
+  try {
+    const record = await readOne(database, CACHE_STORE, key);
+    if (record && record.data !== undefined) {
+      try {
+        if (storage) {
+          await storage.set(key, record.data);
+        }
+        await deleteOne(database, CACHE_STORE, key);
+      } catch {
+        // 迁移失败就继续用旧数据，不影响本次读取。
+      }
+      return record.data;
+    }
+  } catch {
+    // 读不到就按“没有数据”处理。
+  }
+  return undefined;
+};
+
+const writePersistedState = async (key, value, database) => {
+  const storage = foliumRef && foliumRef.storage ? foliumRef.storage : null;
+  if (storage) {
+    try {
+      await storage.set(key, value);
+      return;
+    } catch {
+      // storage 不可用时回落到 IndexedDB，保证旧宿主仍能工作。
+    }
+  }
+  if (database) {
+    await writeCachedData(database, key, value);
+  }
 };
 
 const isLightColor = (value) => {
@@ -419,53 +462,6 @@ const isLightColor = (value) => {
   return (red * 299 + green * 587 + blue * 114) / 1000 > 160;
 };
 
-const rememberDirectoryHandle = async (database, handle) => {
-  const handles = await readCachedData(database, LOCAL_DIR_HANDLES_KEY);
-  const nextHandles = handles && typeof handles === 'object' && !Array.isArray(handles)
-    ? { ...handles }
-    : {};
-  nextHandles[handle.name] = handle;
-  await writeCachedData(database, LOCAL_DIR_HANDLES_KEY, nextHandles);
-  const state = await readCachedData(database, SYNC_STATE_KEY);
-  await writeCachedData(database, SYNC_STATE_KEY, {
-    ...(state && typeof state === 'object' ? state : {}),
-    rootName: handle.name,
-    rootChosenAt: Date.now()
-  });
-  return handle.name;
-};
-
-const rescanSavedDownloadDirectory = async (database, folium, lxData) => {
-  const [state, handles] = await Promise.all([
-    readCachedData(database, SYNC_STATE_KEY),
-    readCachedData(database, LOCAL_DIR_HANDLES_KEY)
-  ]);
-  const rootName = findSavedRootName(state, handles, lxData?.lxSavePath);
-  if (!rootName || !handles?.[rootName]) {
-    return { status: 'not-configured', rootName: '' };
-  }
-
-  const handle = handles[rootName];
-  try {
-    const permission = typeof handle.queryPermission === 'function'
-      ? await handle.queryPermission({ mode: 'read' })
-      : 'granted';
-    if (permission !== 'granted') {
-      return { status: 'needs-permission', rootName };
-    }
-  } catch {
-    return { status: 'needs-permission', rootName };
-  }
-
-  const importDirectory = await loadFoliaBootstrap();
-  if (typeof importDirectory !== 'function') {
-    return { status: 'unsupported-version', rootName };
-  }
-
-  await importDirectory(rootName);
-  return { status: 'rescanned', rootName };
-};
-
 const makeFavoriteRecord = (existing, songIds) => {
   const now = Date.now();
   if (existing) {
@@ -485,6 +481,35 @@ const makeFavoriteRecord = (existing, songIds) => {
     updatedAt: now,
     isFavorite: true
   };
+};
+
+// 「同步历史」的恢复入口：把收藏歌单的 songIds 还原为备份里的快照。
+// 只动收藏歌单本身（其它歌单原地不动），歌单对象的 id/名称/创建时间等
+// 元数据保持原样；只有收藏歌单完全不存在时才新建。
+const restoreFavoriteFromBackup = async (folium, entry) => {
+  const beforeIds = Array.isArray(entry?.before?.songIds) ? entry.before.songIds : null;
+  if (!beforeIds) {
+    throw new Error('这份备份里没有可用的收藏快照');
+  }
+  const database = await openDatabase();
+  try {
+    const record = await readOne(database, CACHE_STORE, LOCAL_PLAYLISTS_KEY);
+    const playlists = Array.isArray(record?.data) ? record.data : [];
+    const currentFavorite = playlists.find((playlist) => playlist && playlist.isFavorite) || null;
+    const nextFavorite = makeFavoriteRecord(currentFavorite, beforeIds);
+    const nextPlaylists = currentFavorite
+      ? playlists.map((playlist) => (playlist === currentFavorite ? nextFavorite : playlist))
+      : [nextFavorite, ...playlists];
+    await putOne(database, CACHE_STORE, {
+      key: LOCAL_PLAYLISTS_KEY,
+      data: nextPlaylists,
+      timestamp: Date.now()
+    });
+    window.dispatchEvent(new CustomEvent('folia-local-music-updated'));
+    return beforeIds.length;
+  } finally {
+    database.close();
+  }
 };
 
 const sameIds = (left, right) => Array.isArray(left)
@@ -668,7 +693,208 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
     ? ctx.params.subscribe(() => paintButton())
     : () => undefined;
   paintButton();
-  root.append(row, hint, statusLine);
+
+  // —— 同步历史（折叠区）：列出每次真实变化，可任选一条回退 ——
+  const historyWrap = document.createElement('div');
+  historyWrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;border-top:1px solid color-mix(in srgb, currentColor 14%, transparent);padding-top:10px;';
+
+  const historyHeader = document.createElement('button');
+  historyHeader.type = 'button';
+  historyHeader.style.cssText = 'display:flex;align-items:center;gap:6px;border:0;padding:2px 0;background:none;color:inherit;font:inherit;font-size:13px;cursor:pointer;text-align:left;';
+
+  const historyBody = document.createElement('div');
+  historyBody.style.cssText = 'display:none;flex-direction:column;gap:6px;max-height:250px;overflow:auto;padding-right:2px;';
+
+  let historyOpen = false;
+  let historyEntries = null;
+  let historyError = '';
+
+  const reasonLabel = (reason) => (
+    reason === 'startup' ? text('启动自动', 'Startup') : text('手动', 'Manual')
+  );
+  const modeLabelOf = (mode) => (
+    normalizeSyncMode(mode) === SYNC_MODE_MERGE ? text('只增加', 'Add only') : text('完全同步', 'Mirror')
+  );
+  const songLabel = (song) => `${song.title || song.id || '?'}${song.artist ? ` - ${song.artist}` : ''}`;
+
+  const makeSmallButton = (label) => {
+    const element = document.createElement('button');
+    element.type = 'button';
+    element.textContent = label;
+    element.style.cssText = 'border:1px solid color-mix(in srgb, currentColor 45%, transparent);border-radius:7px;padding:3px 9px;background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:12px;line-height:1.3;flex:none;';
+    return element;
+  };
+
+  const renderHistory = () => {
+    historyHeader.textContent = historyOpen
+      ? text('同步历史 ▾', 'Sync history ▾')
+      : text('同步历史 ▸', 'Sync history ▸');
+    historyBody.style.display = historyOpen ? 'flex' : 'none';
+    historyBody.replaceChildren();
+    if (!historyOpen) {
+      return;
+    }
+    if (historyError) {
+      const errorLine = document.createElement('div');
+      errorLine.textContent = text(`读取历史失败：${historyError}`, `Failed to load history: ${historyError}`);
+      errorLine.style.cssText = 'font-size:12px;opacity:.8;';
+      historyBody.append(errorLine);
+      return;
+    }
+    if (!historyEntries || historyEntries.length === 0) {
+      const emptyLine = document.createElement('div');
+      emptyLine.textContent = text('还没有同步历史；收藏发生变化时会自动记录。', 'No history yet; records appear when favorites change.');
+      emptyLine.style.cssText = 'font-size:12px;opacity:.7;';
+      historyBody.append(emptyLine);
+      return;
+    }
+
+    historyEntries.forEach((entry) => {
+      const counts = entry.counts || { added: 0, removed: 0 };
+      const timeText = formatLocalTimestamp(entry.at) || entry.at;
+      const card = document.createElement('div');
+      card.style.cssText = 'display:flex;flex-direction:column;gap:6px;border-radius:9px;padding:8px 10px;background:color-mix(in srgb, currentColor 6%, transparent);';
+
+      const head = document.createElement('div');
+      head.style.cssText = 'display:flex;align-items:center;gap:10px;font-size:12px;line-height:1.4;';
+
+      const info = document.createElement('div');
+      info.style.cssText = 'flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;cursor:pointer;user-select:none;';
+      const headLine = document.createElement('span');
+      headLine.textContent = `${timeText} · ${reasonLabel(entry.reason)} · ${modeLabelOf(entry.mode)}`;
+      headLine.style.cssText = 'opacity:.9;';
+      const delta = document.createElement('span');
+      delta.textContent = `+${counts.added || 0} / -${counts.removed || 0}`;
+      delta.style.cssText = 'font-weight:600;opacity:.95;';
+      const toggleHint = document.createElement('span');
+      toggleHint.textContent = '▸';
+      toggleHint.style.cssText = 'opacity:.55;';
+      info.append(headLine, delta, toggleHint);
+
+      const details = document.createElement('div');
+      details.style.cssText = 'display:none;flex-direction:column;gap:3px;font-size:12px;line-height:1.5;opacity:.85;';
+      const fillDetails = () => {
+        if (details.childElementCount > 0) {
+          return;
+        }
+        const changes = entry.changes;
+        const added = Array.isArray(changes?.added) ? changes.added : [];
+        const removed = Array.isArray(changes?.removed) ? changes.removed : [];
+        if (added.length === 0 && removed.length === 0) {
+          const line = document.createElement('div');
+          line.textContent = text('（这份备份来自旧版本，没有明细记录）', '(Older backup: no details recorded.)');
+          line.style.opacity = '.65';
+          details.append(line);
+          return;
+        }
+        if (added.length > 0) {
+          const line = document.createElement('div');
+          line.textContent = `${text('新增', 'Added')}（${counts.added ?? added.length}）：${added.map(songLabel).join('、')}${changes.addedTruncated ? text(' 等', ' …') : ''}`;
+          details.append(line);
+        }
+        if (removed.length > 0) {
+          const line = document.createElement('div');
+          line.textContent = `${text('移除', 'Removed')}（${counts.removed ?? removed.length}）：${removed.map(songLabel).join('、')}${changes.removedTruncated ? text(' 等', ' …') : ''}`;
+          details.append(line);
+        }
+      };
+      info.addEventListener('click', () => {
+        const visible = details.style.display !== 'none';
+        if (!visible) {
+          fillDetails();
+        }
+        details.style.display = visible ? 'none' : 'flex';
+        toggleHint.textContent = visible ? '▸' : '▾';
+      });
+
+      const restoreButton = makeSmallButton(text('回退', 'Restore'));
+      let armed = false;
+      let armTimer = null;
+      const resetArm = () => {
+        armed = false;
+        if (armTimer !== null) {
+          window.clearTimeout(armTimer);
+          armTimer = null;
+        }
+        restoreButton.textContent = text('回退', 'Restore');
+        restoreButton.style.fontWeight = '500';
+      };
+      restoreButton.addEventListener('click', () => {
+        if (restoreButton.disabled) {
+          return;
+        }
+        if (!armed) {
+          armed = true;
+          restoreButton.textContent = text('确认回退?', 'Confirm?');
+          restoreButton.style.fontWeight = '700';
+          armTimer = window.setTimeout(resetArm, 4000);
+          return;
+        }
+        resetArm();
+        restoreButton.disabled = true;
+        restoreButton.style.opacity = '0.55';
+        void (async () => {
+          try {
+            const restoredCount = await restoreFavoriteFromBackup(folium, entry);
+            folium.ui.toast(
+              text(`已回退到 ${timeText} 的状态（收藏 ${restoredCount} 首）`, `Restored to ${timeText} (${restoredCount} favorites).`),
+              { type: 'success', durationMs: 9000 }
+            );
+            await folium.rpc.call('lx.append-log', {
+              level: 'info',
+              message: '已按同步历史回退收藏',
+              details: { file: entry.file, restoredCount, at: entry.at }
+            }).catch(() => undefined);
+            refreshStatus();
+          } catch (error) {
+            folium.ui.toast(
+              text(`回退失败：${error.message}`, `Restore failed: ${error.message}`),
+              { type: 'error', durationMs: 9000 }
+            );
+          } finally {
+            restoreButton.disabled = false;
+            restoreButton.style.opacity = '1';
+          }
+        })();
+      });
+
+      head.append(info, restoreButton);
+      card.append(head, details);
+      historyBody.append(card);
+    });
+  };
+
+  const loadHistory = async () => {
+    try {
+      const list = await folium.rpc.call('lx.read-backup-list');
+      historyEntries = Array.isArray(list) ? list : [];
+      historyError = '';
+    } catch (error) {
+      historyEntries = [];
+      historyError = error.message;
+    }
+    renderHistory();
+  };
+
+  historyHeader.addEventListener('click', () => {
+    historyOpen = !historyOpen;
+    if (historyOpen && historyEntries === null) {
+      historyHeader.textContent = text('同步历史 ▾', 'Sync history ▾');
+      historyBody.style.display = 'flex';
+      historyBody.replaceChildren();
+      const loadingLine = document.createElement('div');
+      loadingLine.textContent = text('加载中…', 'Loading…');
+      loadingLine.style.cssText = 'font-size:12px;opacity:.7;';
+      historyBody.append(loadingLine);
+      void loadHistory();
+      return;
+    }
+    renderHistory();
+  });
+  renderHistory();
+  historyWrap.append(historyHeader, historyBody);
+
+  root.append(row, hint, historyWrap, statusLine);
 
   return () => {
     document.removeEventListener('pointerdown', onDocumentPointerDown, true);
@@ -679,25 +905,25 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
   };
 };
 
+const countMissingHints = (unmatched) => {
+  let downloaded = 0;
+  let maybe = 0;
+  unmatched.forEach((item) => {
+    if (item?.hint === 'downloaded') {
+      downloaded += 1;
+    } else if (item?.hint === 'scan-maybe') {
+      maybe += 1;
+    }
+  });
+  return { downloaded, maybe };
+};
+
 const syncOnce = async (folium, reason) => {
   await syncModeReady.catch(() => undefined);
   await waitForDatabase();
   const database = await openDatabase();
   try {
     const favoriteResponse = await folium.rpc.call('lx.read-favorites');
-    let importStatus = { status: 'skipped', rootName: '' };
-    if (reason === 'startup' || reason === 'manual' || reason === 'manual-import') {
-      try {
-        importStatus = await rescanSavedDownloadDirectory(database, folium, favoriteResponse);
-      } catch (error) {
-        importStatus = { status: 'failed', rootName: '', error: error.message };
-        await folium.rpc.call('lx.append-log', {
-          level: 'warn',
-          message: '自动扫描 LX 下载目录失败，将继续同步现有本地曲库',
-          details: { error: error.message }
-        }).catch(() => undefined);
-      }
-    }
 
     const [localSongs, cacheRecord] = await Promise.all([
       readAll(database, LOCAL_MUSIC_STORE),
@@ -713,13 +939,13 @@ const syncOnce = async (folium, reason) => {
     }
 
     const songs = localSongs.map(songRecord);
-    const { matchedIds, unmatched } = matchFavorites(favorites, songs);
+    const { matchedIds, unmatched } = matchFavorites(favorites, songs, favoriteResponse);
     if (matchedIds.length === 0) {
       throw new Error('LX 收藏没有匹配到 Folia 本地曲库，已停止同步');
     }
 
     const syncMode = normalizeSyncMode(currentSyncMode);
-    const previousState = await readCachedData(database, SYNC_STATE_KEY);
+    const previousState = await readPersistedState(SYNC_STATE_KEY, database);
     const lastMatchedCount = Number(previousState?.lastMatchedCount) || 0;
     if (
       syncMode === SYNC_MODE_MIRROR
@@ -751,6 +977,9 @@ const syncOnce = async (folium, reason) => {
 
     const beforeSet = new Set(previousIds);
     const afterSet = new Set(nextIds);
+    const addedIds = nextIds.filter((id) => !beforeSet.has(id));
+    const removedIds = previousIds.filter((id) => !afterSet.has(id));
+    const hintCounts = countMissingHints(unmatched);
     const summary = {
       reason,
       mode: syncMode,
@@ -760,36 +989,61 @@ const syncOnce = async (folium, reason) => {
       unmatchedCount: unmatched.length,
       previousCount: previousIds.length,
       nextCount: nextIds.length,
-      addedCount: nextIds.filter((id) => !beforeSet.has(id)).length,
-      removedCount: previousIds.filter((id) => !afterSet.has(id)).length,
+      addedCount: addedIds.length,
+      removedCount: removedIds.length,
       changed: !sameIds(previousIds, nextIds),
+      downloadedMissingCount: hintCounts.downloaded,
+      scanMaybeMissingCount: hintCounts.maybe,
       unmatched: unmatched.slice(0, 30),
       databasePath: favoriteResponse?.databasePath || '',
-      downloadRoots: Array.isArray(favoriteResponse?.downloadRoots) ? favoriteResponse.downloadRoots : [],
-      importStatus
+      downloadRoots: Array.isArray(favoriteResponse?.downloadRoots) ? favoriteResponse.downloadRoots : []
     };
 
-    await folium.rpc.call('lx.write-backup', {
-      at: new Date().toISOString(),
-      reason,
-      summary,
-      before: currentFavorite,
-      beforePlaylists: playlists,
-      after: nextFavorite,
-      playlists: nextPlaylists
-    });
-    await writeCachedData(database, MISSING_SNAPSHOT_KEY, {
+    // 备份只在收藏真的发生变化时写（记录变化前的状态），保证
+    // 「回退到某次变化前」始终可用；没有变化的同步不会刷掉旧备份。
+    if (summary.changed) {
+      const songById = new Map(songs.map((song) => [song.id, song]));
+      const detailsOf = (ids) => ids.slice(0, MAX_CHANGE_DETAILS).map((id) => {
+        const song = songById.get(id);
+        return {
+          id,
+          title: song ? song.title : '',
+          artist: song ? song.artist : ''
+        };
+      });
+      await folium.rpc.call('lx.write-backup', {
+        at: new Date().toISOString(),
+        reason,
+        mode: syncMode,
+        counts: {
+          added: addedIds.length,
+          removed: removedIds.length,
+          previous: previousIds.length,
+          next: nextIds.length,
+          source: favorites.length,
+          matched: matchedIds.length,
+          unmatched: unmatched.length
+        },
+        before: { songIds: previousIds },
+        changes: {
+          added: detailsOf(addedIds),
+          removed: detailsOf(removedIds),
+          addedTruncated: addedIds.length > MAX_CHANGE_DETAILS,
+          removedTruncated: removedIds.length > MAX_CHANGE_DETAILS
+        }
+      });
+    }
+    await writePersistedState(MISSING_SNAPSHOT_KEY, {
       at: new Date().toISOString(),
       mode: syncMode,
       sourceCount: favorites.length,
       matchedCount: matchedIds.length,
       items: unmatched
-    });
-    await writeCachedData(database, SYNC_STATE_KEY, {
-      ...(previousState && typeof previousState === 'object' ? previousState : {}),
+    }, database);
+    await writePersistedState(SYNC_STATE_KEY, {
       lastMatchedCount: matchedIds.length,
       lastSyncAt: Date.now()
-    });
+    }, database);
     window.dispatchEvent(new CustomEvent('lx-favorites-sync-updated'));
     await folium.rpc.call('lx.append-log', {
       level: 'info',
@@ -851,7 +1105,7 @@ const mountMissingPanel = (container, ctx) => {
     try {
       const database = await openDatabase();
       try {
-        snapshot = await readCachedData(database, MISSING_SNAPSHOT_KEY);
+        snapshot = await readPersistedState(MISSING_SNAPSHOT_KEY, database);
       } finally {
         database.close();
       }
@@ -877,7 +1131,6 @@ const mountMissingPanel = (container, ctx) => {
           return;
         }
         syncState = 'syncing';
-        feedback = text('正在重新同步…', 'Syncing…');
         safeRender();
         window.dispatchEvent(new CustomEvent('lx-favorites-sync-request'));
       }
@@ -910,11 +1163,31 @@ const mountMissingPanel = (container, ctx) => {
     const items = Array.isArray(snapshot.items) ? snapshot.items : [];
     const summary = document.createElement('div');
     summary.textContent = text(
-      `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，缺失 ${items.length} 首`,
-      `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, missing ${items.length}`
+      items.length === 0
+        ? `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，没有缺失喵~`
+        : `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，缺失 ${items.length} 首喵~`,
+      items.length === 0
+        ? `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, no missing songs.`
+        : `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, missing ${items.length}.`
     );
     summary.style.cssText = 'font-size:12px;opacity:.72;';
     root.append(summary);
+
+    const downloadedCount = items.filter((item) => item?.hint === 'downloaded').length;
+    const maybeCount = items.filter((item) => item?.hint === 'scan-maybe').length;
+    if (downloadedCount > 0 || maybeCount > 0) {
+      const hintLine = document.createElement('div');
+      hintLine.style.cssText = 'font-size:12px;line-height:1.6;opacity:.88;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, currentColor 8%, transparent);';
+      const parts = [];
+      if (downloadedCount > 0) {
+        parts.push(text(`${downloadedCount} 首已下载但未被 Folia 收录`, `${downloadedCount} downloaded but not scanned by Folia`));
+      }
+      if (maybeCount > 0) {
+        parts.push(text(`${maybeCount} 首疑似就在下载目录中`, `${maybeCount} maybe present in the download folder`));
+      }
+      hintLine.textContent = `${parts.join('；')}——${text('请在「本地音乐」里重新扫描对应目录，或在设置里开启「自动扫描本地文件夹」。', 'Rescan the folder from Local Music, or enable "Auto scan local folders" in settings.')}`;
+      root.append(hintLine);
+    }
     if (feedback) {
       const feedbackLine = document.createElement('div');
       feedbackLine.textContent = feedback;
@@ -923,10 +1196,9 @@ const mountMissingPanel = (container, ctx) => {
     }
 
     if (items.length === 0) {
-      const empty = document.createElement('div');
-      empty.textContent = text('没有缺失歌曲。', 'No missing songs.');
-      empty.style.cssText = 'font-size:13px;opacity:.75;';
-      root.append(empty);
+      // 没有缺失时不需要“本地缺失歌曲”这个标题（标签页名已经说明了），
+      // 只留下按钮和上面的汇总行。
+      title.remove();
       return;
     }
 
@@ -1016,8 +1288,19 @@ const mountMissingPanel = (container, ctx) => {
     list.style.cssText = 'display:flex;flex-direction:column;gap:6px;max-height:55vh;overflow:auto;padding-right:4px;';
     sortedItems.forEach((item, index) => {
       const row = document.createElement('div');
-      row.textContent = `${index + 1}. ${item.name || ''}${item.singer ? ` - ${item.singer}` : ''}`;
-      row.style.cssText = 'font-size:13px;line-height:1.45;padding:6px 8px;border-radius:8px;background:color-mix(in srgb, currentColor 8%, transparent);';
+      row.style.cssText = 'display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:1.45;padding:6px 8px;border-radius:8px;background:color-mix(in srgb, currentColor 8%, transparent);';
+      const name = document.createElement('span');
+      name.style.cssText = 'flex:1;min-width:0;';
+      name.textContent = `${index + 1}. ${item.name || ''}${item.singer ? ` - ${item.singer}` : ''}`;
+      row.append(name);
+      if (item.hint === 'downloaded' || item.hint === 'scan-maybe') {
+        const badge = document.createElement('span');
+        badge.textContent = item.hint === 'downloaded'
+          ? text('已下载未收录', 'Not scanned yet')
+          : text('疑似在下载目录', 'Maybe in folder');
+        badge.style.cssText = 'flex:none;font-size:11px;line-height:1.3;padding:2px 7px;border-radius:999px;background:color-mix(in srgb, currentColor 16%, transparent);opacity:.9;';
+        row.append(badge);
+      }
       list.append(row);
     });
     root.append(list);
@@ -1039,18 +1322,14 @@ const mountMissingPanel = (container, ctx) => {
   const onUpdated = () => safeRender();
   const onFinished = (event) => {
     const detail = event.detail || {};
-    if (detail.ok) {
-      const summary = detail.summary || {};
-      feedback = text(
-        `同步完成：匹配 ${summary.matchedCount || 0}/${summary.sourceCount || 0} 首，缺失 ${summary.unmatchedCount || 0} 首`,
-        `Sync complete: matched ${summary.matchedCount || 0}/${summary.sourceCount || 0}, missing ${summary.unmatchedCount || 0}`
-      );
-    } else {
-      feedback = text(
+    // 成功时不再单独显示一行反馈（汇总行会自行刷新，仍有 toast 提示）；
+    // 只有失败时才把错误留在面板上。
+    feedback = detail.ok
+      ? ''
+      : text(
         `同步失败：${detail.error || '未知错误'}`,
         `Sync failed: ${detail.error || 'unknown error'}`
       );
-    }
     syncState = 'idle';
     safeRender();
   };
@@ -1082,11 +1361,11 @@ const mountMissingPanel = (container, ctx) => {
 };
 
 export default function activate(folium) {
+  foliumRef = folium;
   let disposed = false;
   let activeSync = null;
   let startupTimer = null;
   let command = null;
-  let chooseCommand = null;
   let modeSection = null;
   let restoreCommand = null;
   let openMissingCommand = null;
@@ -1121,21 +1400,16 @@ export default function activate(folium) {
           ? `【${syncModeLabel(summary.mode)}】LX 收藏已同步：匹配 ${summary.matchedCount}/${summary.sourceCount} 首`
           : `【${syncModeLabel(summary.mode)}】LX 收藏已检查：${summary.matchedCount}/${summary.sourceCount} 首，无需改动`;
         folium.ui.toast(text, { type: summary.unmatchedCount > 0 ? 'info' : 'success', durationMs: 6000 });
-        if (summary.importStatus?.status === 'not-configured') {
-          folium.ui.toast('如需自动扫描 LX 下载目录，请在命令面板执行一次“选择 LX 下载目录”', {
-            type: 'info',
-            durationMs: 9000
-          });
-        } else if (summary.importStatus?.status === 'needs-permission') {
-          folium.ui.toast('LX 下载目录需要重新授权，请执行“选择 LX 下载目录”', {
-            type: 'info',
-            durationMs: 9000
-          });
-        } else if (summary.importStatus?.status === 'unsupported-version') {
-          folium.ui.toast('当前 Folia 版本无法自动导入目录，请先在 Folia 中手动导入 LX 下载目录', {
-            type: 'info',
-            durationMs: 10000
-          });
+        if (summary.downloadedMissingCount > 0) {
+          folium.ui.toast(
+            `有 ${summary.downloadedMissingCount} 首已下载的歌曲未被 Folia 收录：请在「本地音乐」里重新扫描对应目录，或在设置里开启「自动扫描本地文件夹」`,
+            { type: 'info', durationMs: 12000 }
+          );
+        } else if (summary.scanMaybeMissingCount > 0) {
+          folium.ui.toast(
+            `缺失歌曲里有 ${summary.scanMaybeMissingCount} 首疑似就在 LX 下载目录里：如果已经下载，请在 Folia 里重新扫描对应目录`,
+            { type: 'info', durationMs: 10000 }
+          );
         }
         await folium.rpc.call('lx.write-status', {
           ok: true,
@@ -1185,42 +1459,6 @@ export default function activate(folium) {
     },
     run: async () => {
       await run('manual');
-    }
-  });
-
-  chooseCommand = folium.registries.commands.register({
-    id: CHOOSE_COMMAND_ID,
-    label: {
-      'zh-CN': '选择 LX 下载目录',
-      en: 'Choose LX Download Folder'
-    },
-    description: {
-      'zh-CN': '授权一次 LX 下载目录；以后 Folia 每次启动都会自动扫描其中的新歌曲。',
-      en: 'Authorize the LX download folder once; future Folia launches rescan it automatically.'
-    },
-    run: async () => {
-      try {
-        if (typeof window.showDirectoryPicker !== 'function') {
-          throw new Error('当前 Folia 不支持目录选择，请先在 Folia 中手动导入 LX 下载目录');
-        }
-        const handle = await window.showDirectoryPicker({
-          id: 'lx-favorites-sync-download-root',
-          mode: 'read'
-        });
-        if (!handle) {
-          return;
-        }
-        const database = await openDatabase();
-        try {
-          await rememberDirectoryHandle(database, handle);
-        } finally {
-          database.close();
-        }
-        await run('manual-import', { force: true });
-      } catch (error) {
-        folium.log.error('选择 LX 下载目录失败', error);
-        folium.ui.toast(`选择 LX 下载目录失败：${error.message}`, { type: 'error', durationMs: 9000 });
-      }
     }
   });
 
@@ -1312,54 +1550,6 @@ export default function activate(folium) {
     folium.log.warn('注册同步设置分区失败', error);
   }
 
-  restoreCommand = folium.registries.commands.register({
-    id: RESTORE_COMMAND_ID,
-    label: {
-      'zh-CN': '恢复上次同步前的收藏',
-      en: 'Restore Favorites From Before Last Sync'
-    },
-    description: {
-      'zh-CN': '用最近一次同步前的备份恢复 Folia 本地收藏，主要用于误删后的回滚。',
-      en: 'Restore Folia local favorites from the latest pre-sync backup.'
-    },
-    run: async () => {
-      try {
-        const backup = await folium.rpc.call('lx.read-latest-backup');
-        if (!backup) {
-          throw new Error('没有找到可用的同步备份');
-        }
-
-        const database = await openDatabase();
-        try {
-          let playlists = Array.isArray(backup.beforePlaylists) ? backup.beforePlaylists : null;
-          if (!playlists) {
-            const record = await readOne(database, CACHE_STORE, LOCAL_PLAYLISTS_KEY);
-            playlists = Array.isArray(record?.data) ? record.data : [];
-            if (backup.before) {
-              playlists = playlists.map((playlist) => (
-                playlist?.isFavorite ? backup.before : playlist
-              ));
-            }
-          }
-          await writeCachedData(database, LOCAL_PLAYLISTS_KEY, playlists);
-          window.dispatchEvent(new CustomEvent('folia-local-music-updated'));
-        } finally {
-          database.close();
-        }
-
-        folium.ui.toast('已恢复最近一次同步前的收藏', { type: 'success', durationMs: 9000 });
-        await folium.rpc.call('lx.append-log', {
-          level: 'info',
-          message: '已恢复最近一次同步前的收藏',
-          details: { backupFile: backup.file || '' }
-        }).catch(() => undefined);
-      } catch (error) {
-        folium.log.error('恢复同步前收藏失败', error);
-        folium.ui.toast(`恢复失败：${error.message}`, { type: 'error', durationMs: 9000 });
-      }
-    }
-  });
-
   panelTab = folium.registries.playerPanelTabs.register({
     id: MISSING_PANEL_TAB_ID,
     label: {
@@ -1391,10 +1581,10 @@ export default function activate(folium) {
         try {
           const database = await openDatabase();
           try {
-            const snapshot = await readCachedData(database, MISSING_SNAPSHOT_KEY);
+            const snapshot = await readPersistedState(MISSING_SNAPSHOT_KEY, database);
             const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
             preview = items.length === 0
-              ? '没有本地缺失歌曲。'
+              ? '没有缺失歌曲喵~'
               : `本地缺失 ${items.length} 首，正在打开“本地缺失”面板。`;
           } finally {
             database.close();
@@ -1415,6 +1605,38 @@ export default function activate(folium) {
       } catch (error) {
         folium.log.error('打开本地缺失面板失败', error);
         folium.ui.toast(`打开本地缺失面板失败：${error.message}`, { type: 'error', durationMs: 9000 });
+      }
+    }
+  });
+
+  restoreCommand = folium.registries.commands.register({
+    id: RESTORE_COMMAND_ID,
+    label: {
+      'zh-CN': '恢复最近一次变化前的收藏',
+      en: 'Restore Favorites From Before Last Change'
+    },
+    description: {
+      'zh-CN': '用最新一份同步备份把 Folia 收藏回退到最近一次变化之前（只动收藏歌单）；想回退到更早的状态，请到模组设置的「同步设置」里打开同步历史。',
+      en: 'Restore Folia favorites to just before the latest change (favorites playlist only). Use Sync history in the mod settings to restore an older point.'
+    },
+    run: async () => {
+      try {
+        const list = await folium.rpc.call('lx.read-backup-list');
+        const latest = Array.isArray(list) && list.length > 0 ? list[0] : null;
+        if (!latest) {
+          throw new Error('没有找到可用的同步备份');
+        }
+        const restoredCount = await restoreFavoriteFromBackup(folium, latest);
+        const time = formatLocalTimestamp(latest.at) || latest.at;
+        folium.ui.toast(`已回退到 ${time} 的收藏状态（${restoredCount} 首）`, { type: 'success', durationMs: 9000 });
+        await folium.rpc.call('lx.append-log', {
+          level: 'info',
+          message: '已恢复最近一次变化前的收藏',
+          details: { backupFile: latest.file || '', restoredCount }
+        }).catch(() => undefined);
+      } catch (error) {
+        folium.log.error('恢复同步前收藏失败', error);
+        folium.ui.toast(`恢复失败：${error.message}`, { type: 'error', durationMs: 9000 });
       }
     }
   });
@@ -1504,7 +1726,6 @@ export default function activate(folium) {
     }
     try {
       command?.unregister();
-      chooseCommand?.unregister();
       modeSection?.unregister();
       restoreCommand?.unregister();
       openMissingCommand?.unregister();
