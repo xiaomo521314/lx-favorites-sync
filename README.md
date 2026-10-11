@@ -2,7 +2,9 @@
 
 一个 Folia 模组：把 **LX Music 的「我喜欢」** 自动同步到 **Folia 的本地收藏（Liked Songs）**。
 
-> 作者：xiaomo521314 × 吃白饭的蓝色大肥鱼 ｜ 许可证：MIT
+它**不下载、不搬运音乐文件**：LX 的「我喜欢」是数据源，模组负责把它与你**已有的本地音乐文件**精确匹配，匹配到的歌曲才会写进 Folia 收藏。
+
+> 作者：xiaomo521314 × 吃白饭的蓝色大肥鱼（AI 协作）｜ 许可证：MIT
 
 ## 特性
 
@@ -78,6 +80,12 @@ lx-favorites-sync/       # 模组本体（投稿时指向这个目录）
 ├─ client.js             # 渲染端：匹配、写入 Folia 收藏、命令与面板
 └─ preview.jpg           # 模组市场介绍图
 ```
+
+## 声明
+
+- 本模组是个人项目，非 Folia、LX Music 官方项目，与二者无隶属关系。
+- [LX Music](https://github.com/lyswhut/lx-music-desktop) 是开源项目（Apache-2.0）；本模组不包含、不分发其任何代码，只以只读方式访问其本地数据库文件。
+- 本项目由 AI 编程助手（DeepSeek V4 Flash，昵称「吃白饭的蓝色大肥鱼」）与 xiaomo521314 协作开发，代码经作者测试后发布。
 
 ## 许可证
 

@@ -4,7 +4,7 @@
   "name": "LX Music 收藏同步",
   "version": "1.4.10",
   "author": "xiaomo521314 × 吃白饭的蓝色大肥鱼",
-  "description": "把 LX Music 的“我喜欢”列表同步到 Folia 的本地“Liked Songs”歌单。",
+  "description": "把 LX Music「我喜欢」中的本地歌曲同步到 Folia 本地“Liked Songs”歌单；只匹配已有本地文件，不下载音乐。",
   "main": "main.cjs",
   "client": "client.js",
   "preview": "preview.jpg",
