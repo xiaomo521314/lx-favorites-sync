@@ -14,6 +14,13 @@ const SYNC_MODE_MERGE = 'merge';
 const STARTUP_DELAY_MS = 4500;
 const DB_WAIT_TIMEOUT_MS = 20000;
 const MAX_CHANGE_DETAILS = 300;
+// 「本地缺失」快照存进官方 storage（整个 mod-data.json 上限 1 MB），
+// 超出上限的条目不再保存，面板按 missingCount 显示总数。
+const MAX_SNAPSHOT_ITEMS = 500;
+// 写进同步状态的下载目录数上限（主进程已先截断，这里再兜底一次）。
+const MAX_STATUS_ROOTS = 12;
+// 手动「完全同步」确认会移除收藏后，再次点击生效的时间窗。
+const MIRROR_CONFIRM_WINDOW_MS = 10000;
 
 // 同步模式（完全同步 / 只增加）现在由模组面板的「同步设置」分区维护；
 // 用模块级变量保存，供模块级的 syncOnce 跨 activate 边界读取。
@@ -360,14 +367,6 @@ const readOne = async (database, storeName, key) => {
   return requestResult(transaction.objectStore(storeName).get(key));
 };
 
-const putOne = async (database, storeName, value) => new Promise((resolve, reject) => {
-  const transaction = database.transaction(storeName, 'readwrite');
-  transaction.objectStore(storeName).put(value);
-  transaction.oncomplete = () => resolve();
-  transaction.onerror = () => reject(transaction.error || new Error('IndexedDB 写入失败'));
-  transaction.onabort = () => reject(transaction.error || new Error('IndexedDB 写入已取消'));
-});
-
 const deleteOne = async (database, storeName, key) => new Promise((resolve, reject) => {
   const transaction = database.transaction(storeName, 'readwrite');
   transaction.objectStore(storeName).delete(key);
@@ -376,16 +375,9 @@ const deleteOne = async (database, storeName, key) => new Promise((resolve, reje
   transaction.onabort = () => reject(transaction.error || new Error('IndexedDB 删除已取消'));
 });
 
-const writeCachedData = async (database, key, data) => {
-  await putOne(database, CACHE_STORE, {
-    key,
-    data,
-    timestamp: Date.now()
-  });
-};
-
 // 同步状态/缺失快照这类小数据存进 Folia 官方 storage（与主进程共享同一份
-// mod-data.json）；旧版本存在 IndexedDB 里的键在首次读取时迁移一次。
+// mod-data.json）；旧版本曾写进 IndexedDB 的两个键在首次读取时迁移一次，
+// 迁移成功后删除旧键（新版本不再往 api_cache 写任何东西）。
 const readPersistedState = async (key, database) => {
   const storage = foliumRef && foliumRef.storage ? foliumRef.storage : null;
   if (storage) {
@@ -420,19 +412,115 @@ const readPersistedState = async (key, database) => {
   return undefined;
 };
 
-const writePersistedState = async (key, value, database) => {
+// 只写 Folia 官方 storage（folia >=0.7.17 一定有）。写失败必须抛出：
+// 不允许悄悄改道写 IndexedDB，否则界面会读到旧快照而毫无提示。
+const writePersistedState = async (key, value) => {
   const storage = foliumRef && foliumRef.storage ? foliumRef.storage : null;
-  if (storage) {
-    try {
-      await storage.set(key, value);
-      return;
-    } catch {
-      // storage 不可用时回落到 IndexedDB，保证旧宿主仍能工作。
+  if (!storage) {
+    throw new Error('Folia 官方 storage 不可用，无法保存同步状态');
+  }
+  await storage.set(key, value);
+};
+
+// 读取当前收藏歌单的 songIds。
+const readFavoriteSongIds = async (database) => {
+  const record = await readOne(database, CACHE_STORE, LOCAL_PLAYLISTS_KEY);
+  const playlists = Array.isArray(record?.data) ? record.data : [];
+  const favorite = playlists.find((playlist) => playlist && playlist.isFavorite) || null;
+  return Array.isArray(favorite?.songIds) ? favorite.songIds : [];
+};
+
+// 「读-改-写」放进同一个 readwrite 事务：computeNextIds 在事务内读到的最新
+// songIds 上同步计算，避免用几秒前的旧快照整体覆盖 Folia 里并发发生的
+// 收藏/歌单改动（合并模式下会与最新 songIds 取并集）。
+const applyFavoriteUpdate = (database, computeNextIds) => new Promise((resolve, reject) => {
+  let settled = false;
+  const fail = (error) => {
+    if (!settled) {
+      settled = true;
+      reject(error);
     }
-  }
-  if (database) {
-    await writeCachedData(database, key, value);
-  }
+  };
+  const transaction = database.transaction(CACHE_STORE, 'readwrite');
+  const store = transaction.objectStore(CACHE_STORE);
+  const request = store.get(LOCAL_PLAYLISTS_KEY);
+  let result = null;
+  request.onsuccess = () => {
+    const record = request.result;
+    const playlists = Array.isArray(record?.data) ? record.data : [];
+    const favorite = playlists.find((playlist) => playlist && playlist.isFavorite) || null;
+    const previousIds = Array.isArray(favorite?.songIds) ? favorite.songIds : [];
+    const nextIds = computeNextIds(previousIds);
+    const changed = !sameIds(previousIds, nextIds);
+    if (changed) {
+      const nextFavorite = makeFavoriteRecord(favorite, nextIds);
+      const nextPlaylists = favorite
+        ? playlists.map((playlist) => (playlist === favorite ? nextFavorite : playlist))
+        : [nextFavorite, ...playlists];
+      store.put({
+        key: LOCAL_PLAYLISTS_KEY,
+        data: nextPlaylists,
+        timestamp: Date.now()
+      });
+    }
+    result = { previousIds, nextIds, changed };
+  };
+  transaction.oncomplete = () => {
+    if (!settled) {
+      settled = true;
+      resolve(result || { previousIds: [], nextIds: [], changed: false });
+    }
+  };
+  transaction.onerror = () => fail(transaction.error || new Error('IndexedDB 写入失败'));
+  transaction.onabort = () => fail(transaction.error || new Error('IndexedDB 写入已取消'));
+});
+
+// 备份里的歌曲明细：优先给出本地曲库里的展示名，查不到就只留 id。
+const songDetailsForIds = (ids, songs) => {
+  const songById = new Map(songs.map((song) => [song.id, song]));
+  return ids.slice(0, MAX_CHANGE_DETAILS).map((id) => {
+    const song = songById.get(id);
+    return {
+      id,
+      title: song ? song.title : '',
+      artist: song ? song.artist : ''
+    };
+  });
+};
+
+// 统一构造「变化前快照」备份载荷；同步与回退共用，「回退」也会先记一份，
+// 因此回退本身还能再回退。
+const buildBackupPayload = ({ beforeIds, afterIds, reason, mode, songs, extraCounts }) => {
+  const beforeSet = new Set(beforeIds);
+  const afterSet = new Set(afterIds);
+  const addedIds = afterIds.filter((id) => !beforeSet.has(id));
+  const removedIds = beforeIds.filter((id) => !afterSet.has(id));
+  return {
+    at: new Date().toISOString(),
+    reason,
+    mode,
+    counts: {
+      added: addedIds.length,
+      removed: removedIds.length,
+      previous: beforeIds.length,
+      next: afterIds.length,
+      ...(extraCounts || {})
+    },
+    before: { songIds: beforeIds },
+    changes: {
+      added: songDetailsForIds(addedIds, songs),
+      removed: songDetailsForIds(removedIds, songs),
+      addedTruncated: addedIds.length > MAX_CHANGE_DETAILS,
+      removedTruncated: removedIds.length > MAX_CHANGE_DETAILS
+    }
+  };
+};
+
+// 模组在同步途中被停用时用它安静地中止，不弹错误提示。
+const syncCancelledError = () => {
+  const error = new Error('同步已取消（模组已停用）');
+  error.syncCancelled = true;
+  return error;
 };
 
 const isLightColor = (value) => {
@@ -483,30 +571,40 @@ const makeFavoriteRecord = (existing, songIds) => {
   };
 };
 
-// 「同步历史」的恢复入口：把收藏歌单的 songIds 还原为备份里的快照。
-// 只动收藏歌单本身（其它歌单原地不动），歌单对象的 id/名称/创建时间等
-// 元数据保持原样；只有收藏歌单完全不存在时才新建。
-const restoreFavoriteFromBackup = async (folium, entry) => {
-  const beforeIds = Array.isArray(entry?.before?.songIds) ? entry.before.songIds : null;
-  if (!beforeIds) {
+// 「同步历史」的回退入口：把收藏歌单的 songIds 还原为该备份记录的快照。
+// 回退前先写一份「当前状态」的备份（reason='restore'），所以回退本身也能
+// 再回退；只动收藏歌单本身，其它歌单原地不动，歌单对象的 id/名称/创建时间
+// 等元数据保持原样（只有收藏歌单完全不存在时才新建）。
+const restoreFavoriteFromBackup = async (folium, entry, options = {}) => {
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
+  const targetIds = Array.isArray(entry?.before?.songIds) ? entry.before.songIds : null;
+  if (!targetIds) {
     throw new Error('这份备份里没有可用的收藏快照');
   }
   const database = await openDatabase();
   try {
-    const record = await readOne(database, CACHE_STORE, LOCAL_PLAYLISTS_KEY);
-    const playlists = Array.isArray(record?.data) ? record.data : [];
-    const currentFavorite = playlists.find((playlist) => playlist && playlist.isFavorite) || null;
-    const nextFavorite = makeFavoriteRecord(currentFavorite, beforeIds);
-    const nextPlaylists = currentFavorite
-      ? playlists.map((playlist) => (playlist === currentFavorite ? nextFavorite : playlist))
-      : [nextFavorite, ...playlists];
-    await putOne(database, CACHE_STORE, {
-      key: LOCAL_PLAYLISTS_KEY,
-      data: nextPlaylists,
-      timestamp: Date.now()
-    });
+    const currentIds = await readFavoriteSongIds(database);
+    if (sameIds(currentIds, targetIds)) {
+      return { restoredCount: targetIds.length, changed: false };
+    }
+    if (isCancelled()) {
+      throw syncCancelledError();
+    }
+    // 先备份「回退前」的状态，再执行回退。
+    const localSongs = await readAll(database, LOCAL_MUSIC_STORE);
+    await folium.rpc.call('lx.write-backup', buildBackupPayload({
+      beforeIds: currentIds,
+      afterIds: targetIds,
+      reason: 'restore',
+      mode: currentSyncMode,
+      songs: localSongs.map(songRecord)
+    }));
+    if (isCancelled()) {
+      throw syncCancelledError();
+    }
+    const applied = await applyFavoriteUpdate(database, () => targetIds);
     window.dispatchEvent(new CustomEvent('folia-local-music-updated'));
-    return beforeIds.length;
+    return { restoredCount: applied.nextIds.length, changed: applied.changed };
   } finally {
     database.close();
   }
@@ -556,13 +654,17 @@ const formatLocalTimestamp = (value) => {
 
 // 「同步设置」分区的自绘面板：宿主的 select 会弹出 Windows 系统配色的选项列表，
 // 这里改用自己的下拉控件（颜色跟随主题），并顺带显示上次同步结果。
-const mountSyncSettingsPanel = (folium, container, ctx) => {
+const mountSyncSettingsPanel = (folium, container, ctx, hooks = {}) => {
   const isChinese = String(ctx?.locale || '').toLowerCase().startsWith('zh');
   const text = (zh, en) => isChinese ? zh : en;
   const theme = ctx?.getTheme?.() || {};
   const lightTheme = isLightColor(theme.backgroundColor);
   const hoverAlpha = lightTheme ? 10 : 20;
   const activeAlpha = lightTheme ? 8 : 12;
+  // 「回退」由 activate 里的 runRestore 统一处理（互斥、撤销备份、日志），
+  // 面板只负责按钮状态与二次确认。
+  const requestRestore = typeof hooks.requestRestore === 'function' ? hooks.requestRestore : null;
+  const pendingArmTimers = new Set();
 
   const root = document.createElement('div');
   root.style.cssText = 'display:flex;flex-direction:column;gap:10px;color:var(--folium-primary,inherit);font-family:var(--folium-font,inherit);';
@@ -685,10 +787,17 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
       closeMenu();
     }
   };
-  const onSyncFinished = () => refreshStatus();
+  const onSyncUpdated = () => {
+    refreshStatus();
+    if (historyOpen) {
+      historyEntries = null;
+      void loadHistory();
+    }
+  };
   document.addEventListener('pointerdown', onDocumentPointerDown, true);
   document.addEventListener('keydown', onDocumentKeyDown);
-  window.addEventListener('lx-favorites-sync-finished', onSyncFinished);
+  window.addEventListener('lx-favorites-sync-updated', onSyncUpdated);
+  window.addEventListener('lx-favorites-sync-finished', onSyncUpdated);
   const offParams = typeof ctx?.params?.subscribe === 'function'
     ? ctx.params.subscribe(() => paintButton())
     : () => undefined;
@@ -710,7 +819,9 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
   let historyError = '';
 
   const reasonLabel = (reason) => (
-    reason === 'startup' ? text('启动自动', 'Startup') : text('手动', 'Manual')
+    reason === 'startup' ? text('启动自动', 'Startup')
+      : reason === 'restore' ? text('回退', 'Restore')
+        : text('手动', 'Manual')
   );
   const modeLabelOf = (mode) => (
     normalizeSyncMode(mode) === SYNC_MODE_MERGE ? text('只增加', 'Add only') : text('完全同步', 'Mirror')
@@ -814,6 +925,7 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
         armed = false;
         if (armTimer !== null) {
           window.clearTimeout(armTimer);
+          pendingArmTimers.delete(armTimer);
           armTimer = null;
         }
         restoreButton.textContent = text('回退', 'Restore');
@@ -827,30 +939,24 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
           armed = true;
           restoreButton.textContent = text('确认回退?', 'Confirm?');
           restoreButton.style.fontWeight = '700';
-          armTimer = window.setTimeout(resetArm, 4000);
+          armTimer = window.setTimeout(() => {
+            pendingArmTimers.delete(armTimer);
+            armTimer = null;
+            resetArm();
+          }, 4000);
+          pendingArmTimers.add(armTimer);
           return;
         }
         resetArm();
+        if (!requestRestore) {
+          folium.ui.toast(text('当前环境不支持回退', 'Restore is unavailable here'), { type: 'error', durationMs: 6000 });
+          return;
+        }
         restoreButton.disabled = true;
         restoreButton.style.opacity = '0.55';
         void (async () => {
           try {
-            const restoredCount = await restoreFavoriteFromBackup(folium, entry);
-            folium.ui.toast(
-              text(`已回退到 ${timeText} 的状态（收藏 ${restoredCount} 首）`, `Restored to ${timeText} (${restoredCount} favorites).`),
-              { type: 'success', durationMs: 9000 }
-            );
-            await folium.rpc.call('lx.append-log', {
-              level: 'info',
-              message: '已按同步历史回退收藏',
-              details: { file: entry.file, restoredCount, at: entry.at }
-            }).catch(() => undefined);
-            refreshStatus();
-          } catch (error) {
-            folium.ui.toast(
-              text(`回退失败：${error.message}`, `Restore failed: ${error.message}`),
-              { type: 'error', durationMs: 9000 }
-            );
+            await requestRestore(entry, timeText);
           } finally {
             restoreButton.disabled = false;
             restoreButton.style.opacity = '1';
@@ -899,7 +1005,10 @@ const mountSyncSettingsPanel = (folium, container, ctx) => {
   return () => {
     document.removeEventListener('pointerdown', onDocumentPointerDown, true);
     document.removeEventListener('keydown', onDocumentKeyDown);
-    window.removeEventListener('lx-favorites-sync-finished', onSyncFinished);
+    window.removeEventListener('lx-favorites-sync-updated', onSyncUpdated);
+    window.removeEventListener('lx-favorites-sync-finished', onSyncUpdated);
+    pendingArmTimers.forEach((timer) => window.clearTimeout(timer));
+    pendingArmTimers.clear();
     offParams();
     closeMenu();
   };
@@ -918,17 +1027,21 @@ const countMissingHints = (unmatched) => {
   return { downloaded, maybe };
 };
 
-const syncOnce = async (folium, reason) => {
+const syncOnce = async (folium, reason, options = {}) => {
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
+  const allowMirrorRemoval = typeof options.allowMirrorRemoval === 'function'
+    ? options.allowMirrorRemoval
+    : () => false;
   await syncModeReady.catch(() => undefined);
+  if (isCancelled()) {
+    throw syncCancelledError();
+  }
   await waitForDatabase();
   const database = await openDatabase();
   try {
     const favoriteResponse = await folium.rpc.call('lx.read-favorites');
 
-    const [localSongs, cacheRecord] = await Promise.all([
-      readAll(database, LOCAL_MUSIC_STORE),
-      readOne(database, CACHE_STORE, LOCAL_PLAYLISTS_KEY)
-    ]);
+    const localSongs = await readAll(database, LOCAL_MUSIC_STORE);
 
     const favorites = Array.isArray(favoriteResponse?.items) ? favoriteResponse.items : [];
     if (favorites.length === 0) {
@@ -943,6 +1056,9 @@ const syncOnce = async (folium, reason) => {
     if (matchedIds.length === 0) {
       throw new Error('LX 收藏没有匹配到 Folia 本地曲库，已停止同步');
     }
+    if (isCancelled()) {
+      throw syncCancelledError();
+    }
 
     const syncMode = normalizeSyncMode(currentSyncMode);
     const previousState = await readPersistedState(SYNC_STATE_KEY, database);
@@ -955,31 +1071,63 @@ const syncOnce = async (folium, reason) => {
     ) {
       throw new Error(`匹配结果异常下降（上次 ${lastMatchedCount} 首、本次 ${matchedIds.length} 首），已中止自动完全同步以免误删收藏；如确认无误，请手动执行“同步 LX Music 收藏”。`);
     }
-    const playlists = Array.isArray(cacheRecord?.data) ? cacheRecord.data : [];
-    const currentFavorite = playlists.find((playlist) => playlist && playlist.isFavorite) || null;
-    const previousIds = Array.isArray(currentFavorite?.songIds) ? currentFavorite.songIds : [];
-    const nextIds = syncMode === SYNC_MODE_MERGE
-      ? dedupeIds([...previousIds, ...matchedIds])
-      : matchedIds;
-    const nextFavorite = makeFavoriteRecord(currentFavorite, nextIds);
-    const nextPlaylists = currentFavorite
-      ? playlists.map((playlist) => playlist === currentFavorite ? nextFavorite : playlist)
-      : [nextFavorite, ...playlists];
 
-    if (!sameIds(previousIds, nextIds)) {
-      await putOne(database, CACHE_STORE, {
-        key: LOCAL_PLAYLISTS_KEY,
-        data: nextPlaylists,
-        timestamp: Date.now()
-      });
+    // 变化预估：手动「完全同步」会移除收藏时，先要求再点一次确认。
+    const plannedPreviousIds = await readFavoriteSongIds(database);
+    const plannedNextIds = syncMode === SYNC_MODE_MERGE
+      ? dedupeIds([...plannedPreviousIds, ...matchedIds])
+      : matchedIds;
+    const plannedAfterSet = new Set(plannedNextIds);
+    const plannedRemovedIds = plannedPreviousIds.filter((id) => !plannedAfterSet.has(id));
+    if (
+      syncMode === SYNC_MODE_MIRROR
+      && reason !== 'startup'
+      && plannedRemovedIds.length > 0
+      && !allowMirrorRemoval()
+    ) {
+      const confirmError = new Error(`本次「完全同步」会移除 ${plannedRemovedIds.length} 首 LX 里没有的收藏`);
+      confirmError.needsMirrorConfirm = true;
+      confirmError.removedCount = plannedRemovedIds.length;
+      throw confirmError;
+    }
+
+    // 备份先于写入，且只在收藏真的会发生变化时写：备份失败时不会改动收藏，
+    // 宁可不改，也不留下「改了却没有恢复点」的状态。
+    if (!sameIds(plannedPreviousIds, plannedNextIds)) {
+      await folium.rpc.call('lx.write-backup', buildBackupPayload({
+        beforeIds: plannedPreviousIds,
+        afterIds: plannedNextIds,
+        reason,
+        mode: syncMode,
+        songs,
+        extraCounts: {
+          source: favorites.length,
+          matched: matchedIds.length,
+          unmatched: unmatched.length
+        }
+      }));
+    }
+    if (isCancelled()) {
+      throw syncCancelledError();
+    }
+
+    // 在同一事务里按最新数据重算并写回；合并模式下与最新 songIds 取并集，
+    // 用户在这一期间新建/修改其它歌单也不会被旧数组覆盖。
+    const applied = await applyFavoriteUpdate(database, (previousIds) => (
+      syncMode === SYNC_MODE_MERGE
+        ? dedupeIds([...previousIds, ...matchedIds])
+        : matchedIds
+    ));
+    if (applied.changed) {
       window.dispatchEvent(new CustomEvent('folia-local-music-updated'));
     }
 
-    const beforeSet = new Set(previousIds);
-    const afterSet = new Set(nextIds);
-    const addedIds = nextIds.filter((id) => !beforeSet.has(id));
-    const removedIds = previousIds.filter((id) => !afterSet.has(id));
+    const beforeSet = new Set(applied.previousIds);
+    const afterSet = new Set(applied.nextIds);
+    const addedIds = applied.nextIds.filter((id) => !beforeSet.has(id));
+    const removedIds = applied.previousIds.filter((id) => !afterSet.has(id));
     const hintCounts = countMissingHints(unmatched);
+    const roots = Array.isArray(favoriteResponse?.downloadRoots) ? favoriteResponse.downloadRoots : [];
     const summary = {
       reason,
       mode: syncMode,
@@ -987,63 +1135,52 @@ const syncOnce = async (folium, reason) => {
       localSongCount: localSongs.length,
       matchedCount: matchedIds.length,
       unmatchedCount: unmatched.length,
-      previousCount: previousIds.length,
-      nextCount: nextIds.length,
+      previousCount: applied.previousIds.length,
+      nextCount: applied.nextIds.length,
       addedCount: addedIds.length,
       removedCount: removedIds.length,
-      changed: !sameIds(previousIds, nextIds),
+      changed: applied.changed,
       downloadedMissingCount: hintCounts.downloaded,
       scanMaybeMissingCount: hintCounts.maybe,
       unmatched: unmatched.slice(0, 30),
       databasePath: favoriteResponse?.databasePath || '',
-      downloadRoots: Array.isArray(favoriteResponse?.downloadRoots) ? favoriteResponse.downloadRoots : []
+      downloadRoots: roots.slice(0, MAX_STATUS_ROOTS)
     };
 
-    // 备份只在收藏真的发生变化时写（记录变化前的状态），保证
-    // 「回退到某次变化前」始终可用；没有变化的同步不会刷掉旧备份。
-    if (summary.changed) {
-      const songById = new Map(songs.map((song) => [song.id, song]));
-      const detailsOf = (ids) => ids.slice(0, MAX_CHANGE_DETAILS).map((id) => {
-        const song = songById.get(id);
-        return {
-          id,
-          title: song ? song.title : '',
-          artist: song ? song.artist : ''
-        };
-      });
-      await folium.rpc.call('lx.write-backup', {
+    // 缺失快照有上限；截断时保留总数（missingCount），面板据此显示。
+    try {
+      await writePersistedState(MISSING_SNAPSHOT_KEY, {
         at: new Date().toISOString(),
-        reason,
         mode: syncMode,
-        counts: {
-          added: addedIds.length,
-          removed: removedIds.length,
-          previous: previousIds.length,
-          next: nextIds.length,
-          source: favorites.length,
-          matched: matchedIds.length,
-          unmatched: unmatched.length
-        },
-        before: { songIds: previousIds },
-        changes: {
-          added: detailsOf(addedIds),
-          removed: detailsOf(removedIds),
-          addedTruncated: addedIds.length > MAX_CHANGE_DETAILS,
-          removedTruncated: removedIds.length > MAX_CHANGE_DETAILS
-        }
+        sourceCount: favorites.length,
+        matchedCount: matchedIds.length,
+        missingCount: unmatched.length,
+        itemsTruncated: unmatched.length > MAX_SNAPSHOT_ITEMS,
+        items: unmatched.slice(0, MAX_SNAPSHOT_ITEMS)
       });
+    } catch (error) {
+      folium.log.warn('写入缺失快照失败', error);
+      if (!isCancelled()) {
+        folium.ui.toast(`同步已完成，但缺失快照写入失败（Folia storage 上限 1 MB）：${error.message}`, { type: 'info', durationMs: 9000 });
+      }
+      await folium.rpc.call('lx.append-log', {
+        level: 'warn',
+        message: '写入缺失快照失败',
+        details: { error: error.message }
+      }).catch(() => undefined);
     }
-    await writePersistedState(MISSING_SNAPSHOT_KEY, {
-      at: new Date().toISOString(),
-      mode: syncMode,
-      sourceCount: favorites.length,
-      matchedCount: matchedIds.length,
-      items: unmatched
-    }, database);
-    await writePersistedState(SYNC_STATE_KEY, {
-      lastMatchedCount: matchedIds.length,
-      lastSyncAt: Date.now()
-    }, database);
+    try {
+      await writePersistedState(SYNC_STATE_KEY, {
+        lastMatchedCount: matchedIds.length,
+        lastSyncAt: Date.now()
+      });
+    } catch (error) {
+      await folium.rpc.call('lx.append-log', {
+        level: 'warn',
+        message: '写入同步状态失败',
+        details: { error: error.message }
+      }).catch(() => undefined);
+    }
     window.dispatchEvent(new CustomEvent('lx-favorites-sync-updated'));
     await folium.rpc.call('lx.append-log', {
       level: 'info',
@@ -1161,14 +1298,17 @@ const mountMissingPanel = (container, ctx) => {
     }
 
     const items = Array.isArray(snapshot.items) ? snapshot.items : [];
+    const missingCount = Number.isFinite(Number(snapshot.missingCount))
+      ? Number(snapshot.missingCount)
+      : items.length;
     const summary = document.createElement('div');
     summary.textContent = text(
-      items.length === 0
+      missingCount === 0
         ? `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，没有缺失喵~`
-        : `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，缺失 ${items.length} 首喵~`,
-      items.length === 0
+        : `LX 收藏 ${snapshot.sourceCount || 0} 首，匹配 ${snapshot.matchedCount || 0} 首，缺失 ${missingCount} 首喵~`,
+      missingCount === 0
         ? `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, no missing songs.`
-        : `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, missing ${items.length}.`
+        : `LX favorites ${snapshot.sourceCount || 0}, matched ${snapshot.matchedCount || 0}, missing ${missingCount}.`
     );
     summary.style.cssText = 'font-size:12px;opacity:.72;';
     root.append(summary);
@@ -1304,6 +1444,16 @@ const mountMissingPanel = (container, ctx) => {
       list.append(row);
     });
     root.append(list);
+
+    if (missingCount > items.length) {
+      const note = document.createElement('div');
+      note.textContent = text(
+        `（快照只保留前 ${items.length} 首，共缺失 ${missingCount} 首）`,
+        `(Snapshot keeps the first ${items.length}; ${missingCount} missing in total.)`
+      );
+      note.style.cssText = 'font-size:12px;opacity:.6;';
+      root.append(note);
+    }
   };
 
   const safeRender = () => {
@@ -1364,6 +1514,9 @@ export default function activate(folium) {
   foliumRef = folium;
   let disposed = false;
   let activeSync = null;
+  let activeRestore = null;
+  let mirrorRemovalArmedUntil = 0;
+  let offModeParams = null;
   let startupTimer = null;
   let command = null;
   let modeSection = null;
@@ -1392,10 +1545,25 @@ export default function activate(folium) {
         // A failed startup sync must not block a user-triggered directory import.
       }
     }
+    if (activeRestore) {
+      // 回退进行中：等它结束再同步，避免同步覆盖回退结果。
+      try {
+        await activeRestore;
+      } catch {
+        // 回退失败不应挡住接下来的手动同步。
+      }
+    }
 
     activeSync = (async () => {
       try {
-        const summary = await syncOnce(folium, reason);
+        const summary = await syncOnce(folium, reason, {
+          isCancelled: () => disposed,
+          allowMirrorRemoval: () => mirrorRemovalArmedUntil > Date.now()
+        });
+        mirrorRemovalArmedUntil = 0;
+        if (disposed) {
+          return null;
+        }
         const text = summary.changed
           ? `【${syncModeLabel(summary.mode)}】LX 收藏已同步：匹配 ${summary.matchedCount}/${summary.sourceCount} 首`
           : `【${syncModeLabel(summary.mode)}】LX 收藏已检查：${summary.matchedCount}/${summary.sourceCount} 首，无需改动`;
@@ -1421,8 +1589,29 @@ export default function activate(folium) {
         }));
         return summary;
       } catch (error) {
+        if (error && error.syncCancelled) {
+          return null;
+        }
+        if (error && error.needsMirrorConfirm) {
+          // 「完全同步」会移除收藏：给 10 秒窗口，再点一次同步才真正执行。
+          mirrorRemovalArmedUntil = Date.now() + MIRROR_CONFIRM_WINDOW_MS;
+          if (!disposed) {
+            folium.ui.toast(
+              `本次「完全同步」会移除 ${error.removedCount || 0} 首 LX 里没有的收藏；如确认，请在 10 秒内再次点击同步。`,
+              { type: 'info', durationMs: MIRROR_CONFIRM_WINDOW_MS }
+            );
+          }
+          await folium.rpc.call('lx.append-log', {
+            level: 'info',
+            message: '完全同步待确认：将移除收藏',
+            details: { reason, removedCount: error.removedCount || 0 }
+          }).catch(() => undefined);
+          return null;
+        }
         folium.log.error('LX 收藏同步失败', error);
-        folium.ui.toast(`LX 收藏同步失败：${error.message}`, { type: 'error', durationMs: 9000 });
+        if (!disposed) {
+          folium.ui.toast(`LX 收藏同步失败：${error.message}`, { type: 'error', durationMs: 9000 });
+        }
         await folium.rpc.call('lx.write-status', {
           ok: false,
           at: new Date().toISOString(),
@@ -1445,6 +1634,54 @@ export default function activate(folium) {
     })();
 
     return activeSync;
+  };
+
+  // 回退统一入口（命令卡片与同步历史共用）：与同步互斥；回退前由
+  // restoreFavoriteFromBackup 先写一份「回退前状态」的备份，可再次回退。
+  const runRestore = (entry, timeText) => {
+    if (disposed) {
+      return Promise.resolve(false);
+    }
+    if (activeSync || activeRestore) {
+      folium.ui.toast('同步或回退正在进行，请稍后再试', { type: 'info', durationMs: 6000 });
+      return Promise.resolve(false);
+    }
+    activeRestore = (async () => {
+      try {
+        const result = await restoreFavoriteFromBackup(folium, entry, {
+          isCancelled: () => disposed
+        });
+        if (result.changed) {
+          await folium.rpc.call('lx.append-log', {
+            level: 'info',
+            message: '已按同步历史回退收藏',
+            details: { file: entry?.file || '', restoredCount: result.restoredCount, at: entry?.at || '' }
+          }).catch(() => undefined);
+        }
+        if (!disposed) {
+          folium.ui.toast(
+            result.changed
+              ? `已回退到 ${timeText} 的状态（收藏 ${result.restoredCount} 首）；回退前的状态已记入同步历史，可以再回退。`
+              : `收藏已经是 ${timeText} 时的状态，无需回退。`,
+            { type: 'success', durationMs: 9000 }
+          );
+        }
+        window.dispatchEvent(new CustomEvent('lx-favorites-sync-updated'));
+        return result.changed;
+      } catch (error) {
+        if (error && error.syncCancelled) {
+          return false;
+        }
+        folium.log.error('回退收藏失败', error);
+        if (!disposed) {
+          folium.ui.toast(`回退失败：${error.message}`, { type: 'error', durationMs: 9000 });
+        }
+        return false;
+      } finally {
+        activeRestore = null;
+      }
+    })();
+    return activeRestore;
   };
 
   command = folium.registries.commands.register({
@@ -1496,11 +1733,13 @@ export default function activate(folium) {
             defaultValue: SYNC_MODE_MERGE
           }
         ],
-        settingsPanel: (container, panelCtx) => mountSyncSettingsPanel(folium, container, panelCtx)
+        settingsPanel: (container, panelCtx) => mountSyncSettingsPanel(folium, container, panelCtx, {
+          requestRestore: runRestore
+        })
       });
 
       currentSyncMode = normalizeSyncMode(modeSection.params.get().mode);
-      modeSection.params.subscribe(() => {
+      offModeParams = modeSection.params.subscribe(() => {
         const nextMode = normalizeSyncMode(modeSection.params.get().mode);
         if (nextMode === currentSyncMode) {
           return;
@@ -1583,9 +1822,12 @@ export default function activate(folium) {
           try {
             const snapshot = await readPersistedState(MISSING_SNAPSHOT_KEY, database);
             const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
-            preview = items.length === 0
+            const missingCount = Number.isFinite(Number(snapshot?.missingCount))
+              ? Number(snapshot.missingCount)
+              : items.length;
+            preview = missingCount === 0
               ? '没有缺失歌曲喵~'
-              : `本地缺失 ${items.length} 首，正在打开“本地缺失”面板。`;
+              : `本地缺失 ${missingCount} 首，正在打开“本地缺失”面板。`;
           } finally {
             database.close();
           }
@@ -1626,14 +1868,8 @@ export default function activate(folium) {
         if (!latest) {
           throw new Error('没有找到可用的同步备份');
         }
-        const restoredCount = await restoreFavoriteFromBackup(folium, latest);
         const time = formatLocalTimestamp(latest.at) || latest.at;
-        folium.ui.toast(`已回退到 ${time} 的收藏状态（${restoredCount} 首）`, { type: 'success', durationMs: 9000 });
-        await folium.rpc.call('lx.append-log', {
-          level: 'info',
-          message: '已恢复最近一次变化前的收藏',
-          details: { backupFile: latest.file || '', restoredCount }
-        }).catch(() => undefined);
+        await runRestore(latest, time);
       } catch (error) {
         folium.log.error('恢复同步前收藏失败', error);
         folium.ui.toast(`恢复失败：${error.message}`, { type: 'error', durationMs: 9000 });
@@ -1708,9 +1944,12 @@ export default function activate(folium) {
     }
   }
 
-  startupTimer = window.setTimeout(() => {
-    void run('startup');
-  }, STARTUP_DELAY_MS);
+  // 只有主窗口在启动后自动同步；导出等其它窗口不触发。
+  if (folium.env.context === 'main') {
+    startupTimer = window.setTimeout(() => {
+      void run('startup');
+    }, STARTUP_DELAY_MS);
+  }
 
   folium.log.info('LX 收藏同步客户端已加载');
 
@@ -1725,6 +1964,7 @@ export default function activate(folium) {
       missingRequestHandler = null;
     }
     try {
+      offModeParams?.();
       command?.unregister();
       modeSection?.unregister();
       restoreCommand?.unregister();

@@ -23,6 +23,11 @@ const MAX_LOG_BYTES = 1024 * 1024;
 const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCANNED_FILES = 5000;
 const MAX_SCAN_DEPTH = 6;
+// 扫描最多访问的目录数：下载目录可能包含每个已下载文件所在的文件夹，
+// 甚至下载到桌面 / 用户目录，限制目录数避免同步时长时间卡界面。
+const MAX_SCAN_DIRECTORIES = 250;
+// 参与扫描、写进同步状态的下载根目录数上限。
+const MAX_DOWNLOAD_ROOTS = 12;
 const STORAGE_KEY_SETTINGS = 'settings';
 const STORAGE_KEY_STATUS = 'status';
 const SETTINGS_DEFAULT = Object.freeze({ mode: 'merge' });
@@ -225,9 +230,15 @@ const scanAudioFileNames = (roots) => {
   const seenNames = new Set();
   const queue = roots.map((root) => ({ directory: root, depth: 0 }));
   let cursor = 0;
-  while (cursor < queue.length && names.length < MAX_SCANNED_FILES) {
+  let visitedDirectories = 0;
+  while (
+    cursor < queue.length
+    && names.length < MAX_SCANNED_FILES
+    && visitedDirectories < MAX_SCAN_DIRECTORIES
+  ) {
     const { directory, depth } = queue[cursor];
     cursor += 1;
+    visitedDirectories += 1;
     let entries;
     try {
       entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -285,7 +296,11 @@ const queryLxData = (database, databasePath) => {
   const roots = [];
   const addRoot = (value) => {
     const normalized = normalizePath(value);
-    if (normalized && !roots.some((root) => root.toLowerCase() === normalized.toLowerCase())) {
+    if (
+      normalized
+      && roots.length < MAX_DOWNLOAD_ROOTS
+      && !roots.some((root) => root.toLowerCase() === normalized.toLowerCase())
+    ) {
       roots.push(normalized);
     }
   };
@@ -619,7 +634,9 @@ module.exports = (api) => {
       downloadedMissingCount: Number(payload?.downloadedMissingCount) || 0,
       scanMaybeMissingCount: Number(payload?.scanMaybeMissingCount) || 0,
       unmatched: Array.isArray(payload?.unmatched) ? payload.unmatched.slice(0, 100) : [],
-      downloadRoots: Array.isArray(payload?.downloadRoots) ? payload.downloadRoots : [],
+      downloadRoots: Array.isArray(payload?.downloadRoots)
+        ? payload.downloadRoots.slice(0, MAX_DOWNLOAD_ROOTS)
+        : [],
       error: payload?.error ? String(payload.error) : ''
     };
     try {
