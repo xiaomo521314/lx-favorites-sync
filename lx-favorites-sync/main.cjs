@@ -634,6 +634,8 @@ module.exports = (api) => {
       downloadedMissingCount: Number(payload?.downloadedMissingCount) || 0,
       scanMaybeMissingCount: Number(payload?.scanMaybeMissingCount) || 0,
       unmatched: Array.isArray(payload?.unmatched) ? payload.unmatched.slice(0, 100) : [],
+      sharedCount: Number(payload?.sharedCount) || 0,
+      shared: Array.isArray(payload?.shared) ? payload.shared.slice(0, 100) : [],
       downloadRoots: Array.isArray(payload?.downloadRoots)
         ? payload.downloadRoots.slice(0, MAX_DOWNLOAD_ROOTS)
         : [],

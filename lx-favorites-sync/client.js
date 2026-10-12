@@ -279,23 +279,42 @@ const classifyMissing = (lxItem, hints) => {
   return '';
 };
 
-const chooseCandidate = (lxItem, index) => {
+// 候选排序（从优到劣）：
+//   ① 时长必须一致（硬门槛，时长对不上的文件一律不用）；
+//   ② 文件名能完整解析出「歌名 - 歌手」且与 LX 条目完全一致的文件优先
+//      ——避免"标签重名、其实是别的版本"的文件（如 insturmental.mp3）
+//      把"名字就是这首歌"的文件（如 夏恋 - Otokaze.flac）顶掉；
+//   ③ 匹配来源优先级（内嵌标签 > 标题 > 文件名）；
+//   ④ 曲库顺序（稳定排序，保持原有兜底行为）。
+const candidatePriority = { metadata: 3, title: 2, filename: 1 };
+
+const rankCandidates = (lxItem, index) => {
   if (!lxItem.title || !lxItem.artist) {
-    return null;
+    return [];
   }
   const matches = index.byFields.get(fieldKey(lxItem.title, lxItem.artist)) || [];
   if (matches.length === 0) {
-    return null;
+    return [];
   }
-  const priority = { metadata: 3, title: 2, filename: 1 };
+  const titleKey = normalizeText(lxItem.title);
+  const artistKey = normalizeText(lxItem.artist);
+  // 注意：song.variants 里同名变体会被去重（文件名与内嵌标签一致时只留标签那份），
+  // 所以这里直接从 fileName 重新解析「歌名 - 歌手」。
+  const namedLike = (song) => {
+    const fromFile = splitTitleArtist(basenameWithoutExtension(song.fileName));
+    return Boolean(fromFile)
+      && normalizeText(fromFile.title) === titleKey
+      && normalizeText(fromFile.artist) === artistKey;
+  };
   const scoreOf = (entry) => (
-    (durationMatches(entry.song, lxItem) ? 100 : 0) + (priority[entry.source] || 0)
+    (durationMatches(entry.song, lxItem) ? 100 : 0)
+    + (namedLike(entry.song) ? 10 : 0)
+    + (candidatePriority[entry.source] || 0)
   );
-  const best = [...matches].sort((left, right) => scoreOf(right) - scoreOf(left))[0];
-  if (lxItem.durationSec && !durationMatches(best.song, lxItem)) {
-    return null;
-  }
-  return best.song;
+  const ranked = [...matches].sort((left, right) => scoreOf(right) - scoreOf(left));
+  return lxItem.durationSec
+    ? ranked.filter((entry) => durationMatches(entry.song, lxItem))
+    : ranked;
 };
 
 const matchFavorites = (favorites, songs, downloadInfo) => {
@@ -303,12 +322,13 @@ const matchFavorites = (favorites, songs, downloadInfo) => {
   const hints = buildMissingHints(downloadInfo);
   const matchedIds = [];
   const unmatched = [];
+  const shared = [];
   const seenIds = new Set();
 
   favorites.forEach((favorite) => {
     const lxItem = lxRecord(favorite);
-    const song = chooseCandidate(lxItem, index);
-    if (!song) {
+    const candidates = rankCandidates(lxItem, index);
+    if (candidates.length === 0) {
       const item = { id: lxItem.id, name: lxItem.title, singer: lxItem.artist };
       const hint = classifyMissing(lxItem, hints);
       if (hint) {
@@ -317,13 +337,18 @@ const matchFavorites = (favorites, songs, downloadInfo) => {
       unmatched.push(item);
       return;
     }
-    if (!seenIds.has(song.id)) {
-      seenIds.add(song.id);
-      matchedIds.push(song.id);
+    // 最优候选被更早的收藏占用时，顺延到下一个合格候选；
+    // 所有合格候选都被占用时才算「与其它收藏共用同一个本地文件」。
+    const picked = candidates.find((candidate) => !seenIds.has(candidate.song.id)) || null;
+    if (!picked) {
+      shared.push({ id: lxItem.id, name: lxItem.title, singer: lxItem.artist });
+      return;
     }
+    seenIds.add(picked.song.id);
+    matchedIds.push(picked.song.id);
   });
 
-  return { matchedIds, unmatched };
+  return { matchedIds, unmatched, shared };
 };
 
 const openDatabase = () => new Promise((resolve, reject) => {
@@ -1052,7 +1077,7 @@ const syncOnce = async (folium, reason, options = {}) => {
     }
 
     const songs = localSongs.map(songRecord);
-    const { matchedIds, unmatched } = matchFavorites(favorites, songs, favoriteResponse);
+    const { matchedIds, unmatched, shared } = matchFavorites(favorites, songs, favoriteResponse);
     if (matchedIds.length === 0) {
       throw new Error('LX 收藏没有匹配到 Folia 本地曲库，已停止同步');
     }
@@ -1135,6 +1160,7 @@ const syncOnce = async (folium, reason, options = {}) => {
       localSongCount: localSongs.length,
       matchedCount: matchedIds.length,
       unmatchedCount: unmatched.length,
+      sharedCount: shared.length,
       previousCount: applied.previousIds.length,
       nextCount: applied.nextIds.length,
       addedCount: addedIds.length,
@@ -1143,6 +1169,7 @@ const syncOnce = async (folium, reason, options = {}) => {
       downloadedMissingCount: hintCounts.downloaded,
       scanMaybeMissingCount: hintCounts.maybe,
       unmatched: unmatched.slice(0, 30),
+      shared: shared.slice(0, 30),
       databasePath: favoriteResponse?.databasePath || '',
       downloadRoots: roots.slice(0, MAX_STATUS_ROOTS)
     };
@@ -1155,6 +1182,7 @@ const syncOnce = async (folium, reason, options = {}) => {
         sourceCount: favorites.length,
         matchedCount: matchedIds.length,
         missingCount: unmatched.length,
+        sharedCount: shared.length,
         itemsTruncated: unmatched.length > MAX_SNAPSHOT_ITEMS,
         items: unmatched.slice(0, MAX_SNAPSHOT_ITEMS)
       });
@@ -1327,6 +1355,16 @@ const mountMissingPanel = (container, ctx) => {
       }
       hintLine.textContent = `${parts.join('；')}——${text('请在「本地音乐」里重新扫描对应目录，或在设置里开启「自动扫描本地文件夹」。', 'Rescan the folder from Local Music, or enable "Auto scan local folders" in settings.')}`;
       root.append(hintLine);
+    }
+    const sharedCount = Number.isFinite(Number(snapshot.sharedCount)) ? Number(snapshot.sharedCount) : 0;
+    if (sharedCount > 0) {
+      const sharedLine = document.createElement('div');
+      sharedLine.textContent = text(
+        `另有 ${sharedCount} 首与其它收藏共用同一个本地文件（不会重复添加）喵~`,
+        `${sharedCount} more favorite(s) share a local file with another favorite (not added twice).`
+      );
+      sharedLine.style.cssText = 'font-size:12px;line-height:1.6;opacity:.85;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, currentColor 8%, transparent);';
+      root.append(sharedLine);
     }
     if (feedback) {
       const feedbackLine = document.createElement('div');
@@ -1825,8 +1863,13 @@ export default function activate(folium) {
             const missingCount = Number.isFinite(Number(snapshot?.missingCount))
               ? Number(snapshot.missingCount)
               : items.length;
+            const sharedCount = Number.isFinite(Number(snapshot?.sharedCount))
+              ? Number(snapshot.sharedCount)
+              : 0;
             preview = missingCount === 0
-              ? '没有缺失歌曲喵~'
+              ? (sharedCount > 0
+                ? `没有缺失歌曲，另有 ${sharedCount} 首与其它收藏共用同一本地文件喵~`
+                : '没有缺失歌曲喵~')
               : `本地缺失 ${missingCount} 首，正在打开“本地缺失”面板。`;
           } finally {
             database.close();
